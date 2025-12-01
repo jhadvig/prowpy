@@ -1,4 +1,4 @@
-# Flaky Resolver
+# Prowpy
 
 A web application for managing and resolving flaky CI tests in OpenShift Console repositories. It helps developers quickly identify failing PRs, view test details, and trigger retests.
 
@@ -39,7 +39,7 @@ A web application for managing and resolving flaky CI tests in OpenShift Console
 1. Go to [GitHub Developer Settings](https://github.com/settings/developers)
 2. Click "New OAuth App"
 3. Fill in the details:
-   - **Application name**: Flaky Resolver (or your preferred name)
+   - **Application name**: Prowpy (or your preferred name)
    - **Homepage URL**: `http://localhost:3000`
    - **Authorization callback URL**: `http://localhost:3000/auth/github/callback`
 4. Click "Register application"

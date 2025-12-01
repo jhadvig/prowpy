@@ -1,7 +1,7 @@
 {
-  "name": "flaky-resolver",
+  "name": "prowpy",
   "version": "1.0.0",
-  "description": "GitHub PR CI Flaky Test Resolver for OpenShift Console",
+  "description": "A web application for managing and resolving flaky CI tests in OpenShift Console repositories",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
