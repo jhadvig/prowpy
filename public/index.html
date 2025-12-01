@@ -1,0 +1,1477 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Flaky Resolver - OpenShift Console CI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            'rh-red': '#ee0000',
+            'rh-dark': '#151515',
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    .spinner {
+      border: 3px solid #f3f3f3;
+      border-top: 3px solid #3b82f6;
+      border-radius: 50%;
+      width: 20px;
+      height: 20px;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body class="bg-gray-50 min-h-screen">
+  <!-- Header -->
+  <header class="bg-rh-dark text-white shadow-lg">
+    <div class="max-w-7xl mx-auto px-4 py-4 flex justify-between items-center">
+      <h1 class="text-xl font-bold flex items-center gap-2">
+        <svg class="w-6 h-6 text-rh-red" fill="currentColor" viewBox="0 0 24 24">
+          <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+        </svg>
+        Flaky Resolver
+      </h1>
+      <div id="userSection"></div>
+    </div>
+  </header>
+
+  <!-- Main Content -->
+  <main class="max-w-7xl mx-auto px-4 py-6">
+    <div id="alertContainer" class="fixed top-4 right-4 z-50 space-y-2"></div>
+    <div id="appContent"></div>
+  </main>
+
+  <script>
+    // State
+    let currentUser = null;
+    let prs = [];
+    let selectedPRs = new Set();
+    let prDetails = {};
+    let expandedPRs = new Set();
+    let currentFilter = 'all';
+
+    // Advanced filter state
+    let searchQuery = '';
+    let branchFilters = new Set(); // Multi-select
+    let statusFilters = new Set(); // Multi-select
+    let roleFilters = new Set(); // Multi-select
+    let isRefreshing = false;
+    let isFiltersExpanded = localStorage.getItem('filtersExpanded') !== 'false'; // Default open, remember preference
+    let isLoadingPRs = false;
+    let sortBy = localStorage.getItem('sortBy') || 'updatedAt'; // 'updatedAt', 'createdAt', 'number'
+    let sortOrder = localStorage.getItem('sortOrder') || 'desc'; // 'asc', 'desc'
+    let groupByStatus = localStorage.getItem('groupByStatus') !== 'false'; // Default true
+    // Collapsed groups - default all expanded
+    let savedCollapsedGroups = [];
+    try {
+      savedCollapsedGroups = JSON.parse(localStorage.getItem('collapsedGroups') || '[]');
+    } catch (e) {
+      savedCollapsedGroups = [];
+    }
+    let collapsedGroups = new Set(savedCollapsedGroups);
+    // Always expand loading group on page load
+    collapsedGroups.delete('loading');
+    localStorage.setItem('collapsedGroups', JSON.stringify([...collapsedGroups]));
+
+    // i18n translations
+    const i18n = {
+      appTitle: 'Flaky Resolver',
+      loginTitle: 'Welcome to Flaky Resolver',
+      loginDescription: 'Sign in with your GitHub account to view your Pull Requests from openshift/console and manage flaky CI tests.',
+      loginButton: 'Sign in with GitHub',
+      logoutButton: 'Sign out',
+      loadingPRs: 'Loading your Pull Requests...',
+      noPRsFound: 'No Pull Requests found',
+      noPRsDescription: 'You have no open PRs in openshift/console where you are the author, reviewer, or assignee.',
+      filterAll: 'All PRs',
+      filterFailing: 'Failing CI',
+      filterPotentialFlakes: 'Potential Flakes',
+      filterOtherFailing: 'Other Failing CI',
+      filterPending: 'Pending CI',
+      filterMine: 'My PRs',
+      filterMissingLabels: 'Need Labels',
+      batchActions: 'Batch Actions',
+      selectAllFailing: 'Select Failing',
+      selectAllVisible: 'Select All Visible',
+      deselectAll: 'Deselect All',
+      retestSelected: 'Retest Selected',
+      retestButton: 'Retest',
+      viewDetails: 'Details',
+      hideDetails: 'Hide',
+      loadingDetails: 'Loading CI details...',
+      failingTests: 'Failing Specs',
+      noFailingTests: 'No failing spec details found in logs',
+      jobHistory: 'Job History (Last 4 runs)',
+      noJobHistory: 'No job history available',
+      buildLog: 'Build Log',
+      roleAuthor: 'Author',
+      roleReviewer: 'Reviewer',
+      roleAssignee: 'Assignee',
+      statusSuccess: 'Passed',
+      statusFailure: 'Failed',
+      statusPending: 'Pending',
+      statusLoading: 'Loading...',
+      statusAborted: 'Aborted',
+      statusNotFound: 'Not Found',
+      retestTriggered: 'Retest triggered for PR #',
+      retestFailed: 'Failed to trigger retest for PR #',
+      batchRetestComplete: 'Batch retest completed',
+      errorFetchingPRs: 'Error fetching Pull Requests',
+      prNumber: 'PR #',
+      by: 'by',
+      // Search and filter labels
+      searchLabel: 'Search',
+      searchPlaceholder: 'Search by PR #, title, or author...',
+      branchLabel: 'Branch',
+      allBranches: 'All Branches',
+      statusLabel: 'CI Status',
+      allStatuses: 'All Statuses',
+      roleLabel: 'My Role',
+      allRoles: 'All Roles',
+      clearFilters: 'Clear All',
+      activeFilters: 'Active filters',
+      noResults: 'No PRs match your filters',
+      refresh: 'Refresh',
+      refreshing: 'Refreshing...',
+      showFilters: 'Show Filters',
+      hideFilters: 'Hide Filters',
+      loadingCIStatus: 'Loading CI status...',
+      sortBy: 'Sort by',
+      sortUpdated: 'Last Updated',
+      sortCreated: 'Created',
+      sortPRNumber: 'PR Number',
+      sortAsc: 'Oldest first',
+      sortDesc: 'Newest first',
+      groupByStatus: 'Group by status',
+      groupFailing: 'Failing CI',
+      groupPending: 'Pending CI',
+      groupSuccess: 'Passing CI',
+      groupLoading: 'Loading...',
+      groupOther: 'Other'
+    };
+
+    // Initialize app
+    async function init() {
+      await checkAuth();
+      render();
+    }
+
+    // Check authentication status
+    async function checkAuth() {
+      try {
+        const response = await fetch('/api/user');
+        currentUser = await response.json();
+      } catch (error) {
+        console.error('Error checking auth:', error);
+        currentUser = null;
+      }
+    }
+
+    // Render the application
+    function render() {
+      renderUserSection();
+      renderContent();
+    }
+
+    // Render user section in header
+    function renderUserSection() {
+      const userSection = document.getElementById('userSection');
+      if (currentUser) {
+        userSection.innerHTML = `
+          <div class="flex items-center gap-3">
+            <button onclick="refreshPRs()" id="refreshBtn" ${isRefreshing ? 'disabled' : ''} class="flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700 px-3 py-1.5 rounded text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-blue-600">
+              <svg class="w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+              </svg>
+              ${isRefreshing ? i18n.refreshing : i18n.refresh}
+            </button>
+            <img src="${currentUser.avatar}" alt="${currentUser.login}" class="w-8 h-8 rounded-full border-2 border-gray-600">
+            <span class="font-medium">${currentUser.name || currentUser.login}</span>
+            <a href="/auth/logout" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition-colors">
+              ${i18n.logoutButton}
+            </a>
+          </div>
+        `;
+      } else {
+        userSection.innerHTML = '';
+      }
+    }
+
+    // Render main content
+    function renderContent() {
+      const content = document.getElementById('appContent');
+      if (!currentUser) {
+        content.innerHTML = renderLoginPage();
+      } else {
+        content.innerHTML = renderLoadingState();
+        loadPRs();
+      }
+    }
+
+    // Login page
+    function renderLoginPage() {
+      return `
+        <div class="flex flex-col items-center justify-center min-h-[60vh]">
+          <div class="bg-white rounded-xl shadow-lg p-8 max-w-md w-full text-center">
+            <div class="mb-6">
+              <svg class="w-16 h-16 mx-auto text-rh-red" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+              </svg>
+            </div>
+            <h2 class="text-2xl font-bold text-gray-900 mb-2">${i18n.loginTitle}</h2>
+            <p class="text-gray-600 mb-6">${i18n.loginDescription}</p>
+            <a href="/auth/github" id="githubLoginBtn" onclick="handleLoginClick(event)" class="inline-flex items-center justify-center gap-2 bg-gray-900 hover:bg-gray-800 text-white px-6 py-3 rounded-lg font-medium transition-colors w-full">
+              <svg id="githubIcon" class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24">
+                <path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
+              </svg>
+              <span id="loginBtnText">${i18n.loginButton}</span>
+            </a>
+          </div>
+        </div>
+      `;
+    }
+
+    // Handle login button click - show loading state
+    function handleLoginClick(event) {
+      const btn = document.getElementById('githubLoginBtn');
+      const icon = document.getElementById('githubIcon');
+      const text = document.getElementById('loginBtnText');
+
+      // Replace icon with spinner
+      icon.outerHTML = '<div class="spinner" style="width: 20px; height: 20px; border-width: 2px; border-top-color: white;"></div>';
+      text.textContent = 'Redirecting...';
+      btn.classList.add('opacity-75', 'cursor-wait');
+      btn.classList.remove('hover:bg-gray-800');
+    }
+
+    // Loading state
+    function renderLoadingState() {
+      return `
+        <div class="flex flex-col items-center justify-center py-16">
+          <div class="spinner mb-4" style="width: 40px; height: 40px;"></div>
+          <span class="text-gray-600">${i18n.loadingPRs}</span>
+        </div>
+      `;
+    }
+
+    // Load PRs from API
+    async function loadPRs() {
+      try {
+        isLoadingPRs = true;
+        const response = await fetch('/api/prs');
+        if (!response.ok) throw new Error('Failed to fetch PRs');
+        prs = await response.json();
+        renderPRList();
+        // Load CI status for each PR in background
+        await loadAllCIStatus();
+      } catch (error) {
+        console.error('Error loading PRs:', error);
+        showAlert(i18n.errorFetchingPRs, 'error');
+        document.getElementById('appContent').innerHTML = renderEmptyState();
+      } finally {
+        isLoadingPRs = false;
+      }
+    }
+
+    // Refresh PRs and their status
+    async function refreshPRs() {
+      if (isRefreshing) return;
+
+      isRefreshing = true;
+      renderUserSection();
+
+      try {
+        // Clear cached details
+        prDetails = {};
+
+        // Reload PRs from API
+        const response = await fetch('/api/prs');
+        if (!response.ok) throw new Error('Failed to fetch PRs');
+        prs = await response.json();
+        renderPRList();
+
+        // Reload CI status for all PRs
+        await loadAllCIStatus();
+
+        showAlert('PRs refreshed successfully', 'success');
+      } catch (error) {
+        console.error('Error refreshing PRs:', error);
+        showAlert('Failed to refresh PRs', 'error');
+      } finally {
+        isRefreshing = false;
+        renderUserSection();
+      }
+    }
+
+    // Load CI status for all PRs in parallel
+    async function loadAllCIStatus() {
+      const promises = prs.map(async (pr) => {
+        try {
+          const repoParam = pr.repo ? `?repo=${encodeURIComponent(pr.repo)}` : '';
+          const response = await fetch(`/api/pr-status/${pr.number}/${pr.headSha}${repoParam}`);
+          if (response.ok) {
+            const data = await response.json();
+            const prIndex = prs.findIndex(p => p.number === pr.number && p.repo === pr.repo);
+            if (prIndex !== -1) {
+              prs[prIndex].e2eStatus = data.e2eStatus;
+              prs[prIndex].e2eDetailsUrl = data.e2eDetailsUrl;
+              prs[prIndex].otherFailingJobs = data.otherFailingJobs || [];
+              updatePRCard(pr.number, pr.repo);
+            }
+          }
+        } catch (error) {
+          console.error(`Error loading status for PR #${pr.number}:`, error);
+        }
+      });
+      await Promise.all(promises);
+      // Re-render the entire list to properly group PRs by their new status
+      if (groupByStatus) {
+        const prListEl = document.getElementById('prList');
+        if (prListEl) {
+          prListEl.innerHTML = renderPRListContent();
+        }
+      }
+      updateFilterCounts();
+    }
+
+    // Update a single PR card
+    function updatePRCard(prNumber, repo = 'console') {
+      // Skip individual updates when grouping - we'll do a full re-render after all statuses load
+      if (groupByStatus) return;
+
+      const pr = prs.find(p => p.number === prNumber && p.repo === repo);
+      if (!pr) return;
+
+      const card = document.querySelector(`[data-pr="${prNumber}"][data-repo="${repo}"]`);
+      if (card) {
+        card.outerHTML = renderPRCard(pr);
+        applyCurrentFilter();
+      }
+    }
+
+    // Update filter counts
+    function updateFilterCounts() {
+      const allCount = document.getElementById('count-all');
+      const potentialFlakesCount = document.getElementById('count-potential-flakes');
+      const otherFailingCount = document.getElementById('count-other-failing');
+      const mineCount = document.getElementById('count-mine');
+      const missingLabelsCount = document.getElementById('count-missing-labels');
+
+      if (allCount) allCount.textContent = prs.length;
+      // Potential flakes: e2e failure but NO other failing jobs
+      if (potentialFlakesCount) potentialFlakesCount.textContent = prs.filter(pr => pr.e2eStatus === 'failure' && !(pr.otherFailingJobs || []).length).length;
+      if (otherFailingCount) otherFailingCount.textContent = prs.filter(pr => (pr.otherFailingJobs || []).length > 0).length;
+      if (mineCount) mineCount.textContent = prs.filter(pr => pr.isAuthor).length;
+      if (missingLabelsCount) missingLabelsCount.textContent = prs.filter(pr => isMissingLabels(pr)).length;
+
+      // Hide loading indicator if no PRs are still loading
+      const loadingIndicator = document.getElementById('loadingIndicator');
+      if (loadingIndicator) {
+        const stillLoading = prs.some(pr => pr.e2eStatus === 'loading');
+        loadingIndicator.classList.toggle('hidden', !stillLoading);
+      }
+    }
+
+    // Helper to check if PR is missing required labels (needs lgtm AND approved AND verified)
+    function isMissingLabels(pr) {
+      return pr.isAuthor && (!pr.hasLgtm || !pr.hasApproved || !pr.hasVerified);
+    }
+
+    // Helper to check if PR CI is pending
+    function isPending(pr) {
+      return ['pending', 'in_progress', 'queued', 'loading'].includes(pr.e2eStatus);
+    }
+
+    // Render PR list
+    function renderPRList() {
+      const content = document.getElementById('appContent');
+
+      if (prs.length === 0) {
+        content.innerHTML = renderEmptyState();
+        return;
+      }
+
+      const failingPRs = prs.filter(pr => pr.e2eStatus === 'failure');
+      // Potential flakes: e2e failure but NO other failing jobs (likely just flaky tests)
+      const potentialFlakesPRs = prs.filter(pr => pr.e2eStatus === 'failure' && !(pr.otherFailingJobs || []).length);
+      const otherFailingPRs = prs.filter(pr => (pr.otherFailingJobs || []).length > 0);
+      const missingLabelsPRs = prs.filter(pr => isMissingLabels(pr));
+
+      // Get unique branches for filter dropdown
+      const branches = [...new Set(prs.map(pr => pr.baseBranch || 'main'))].sort();
+
+      content.innerHTML = `
+        <!-- Search and Advanced Filters -->
+        <div class="bg-white rounded-lg shadow p-4 mb-4">
+          <!-- Search Input -->
+          <div class="flex gap-2 items-center">
+            <div class="relative flex-1">
+              <input type="text" id="searchInput" placeholder="${i18n.searchPlaceholder}"
+                     class="w-full pl-10 pr-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                     value="${searchQuery}"
+                     oninput="handleSearch(this.value)">
+              <svg class="absolute left-3 top-2.5 w-5 h-5 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/>
+              </svg>
+              ${searchQuery ? `
+                <button onclick="clearSearch()" class="absolute right-3 top-2.5 text-gray-400 hover:text-gray-600">
+                  <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+                  </svg>
+                </button>
+              ` : ''}
+            </div>
+            <button onclick="toggleFiltersPanel()" class="flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-lg transition-colors">
+              <svg class="w-4 h-4 transition-transform ${isFiltersExpanded ? 'rotate-180' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+              </svg>
+              ${isFiltersExpanded ? i18n.hideFilters : i18n.showFilters}
+              ${(branchFilters.size + statusFilters.size + roleFilters.size) > 0 ? `<span class="ml-1 px-1.5 py-0.5 bg-blue-600 text-white text-xs rounded-full">${branchFilters.size + statusFilters.size + roleFilters.size}</span>` : ''}
+            </button>
+          </div>
+
+          <!-- Collapsible Multi-select Filter Groups -->
+          <div id="filtersPanel" class="${isFiltersExpanded ? '' : 'hidden'} mt-4 pt-4 border-t space-y-3">
+            <!-- Branch Filters -->
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-2">${i18n.branchLabel}</label>
+              <div class="flex flex-wrap gap-2">
+                ${branches.map(b => `
+                  <button onclick="toggleBranchFilter('${b}')"
+                          class="px-3 py-1.5 text-sm rounded-full border transition-colors ${branchFilters.has(b)
+                            ? 'bg-cyan-600 text-white border-cyan-600 hover:bg-cyan-700'
+                            : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}">
+                    ${b}
+                    ${branchFilters.has(b) ? '<span class="ml-1">&times;</span>' : ''}
+                  </button>
+                `).join('')}
+              </div>
+            </div>
+
+            <!-- Status Filters -->
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-2">${i18n.statusLabel}</label>
+              <div class="flex flex-wrap gap-2">
+                <button onclick="toggleStatusFilter('success')"
+                        class="px-3 py-1.5 text-sm rounded-full border transition-colors ${statusFilters.has('success')
+                          ? 'bg-green-600 text-white border-green-600 hover:bg-green-700'
+                          : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}">
+                  ${i18n.statusSuccess}
+                  ${statusFilters.has('success') ? '<span class="ml-1">&times;</span>' : ''}
+                </button>
+                <button onclick="toggleStatusFilter('failure')"
+                        class="px-3 py-1.5 text-sm rounded-full border transition-colors ${statusFilters.has('failure')
+                          ? 'bg-red-600 text-white border-red-600 hover:bg-red-700'
+                          : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}">
+                  ${i18n.statusFailure}
+                  ${statusFilters.has('failure') ? '<span class="ml-1">&times;</span>' : ''}
+                </button>
+                <button onclick="toggleStatusFilter('pending')"
+                        class="px-3 py-1.5 text-sm rounded-full border transition-colors ${statusFilters.has('pending')
+                          ? 'bg-yellow-500 text-white border-yellow-500 hover:bg-yellow-600'
+                          : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}">
+                  ${i18n.statusPending}
+                  ${statusFilters.has('pending') ? '<span class="ml-1">&times;</span>' : ''}
+                </button>
+              </div>
+            </div>
+
+            <!-- Role Filters -->
+            <div>
+              <label class="block text-sm font-medium text-gray-700 mb-2">${i18n.roleLabel}</label>
+              <div class="flex flex-wrap gap-2">
+                <button onclick="toggleRoleFilter('author')"
+                        class="px-3 py-1.5 text-sm rounded-full border transition-colors ${roleFilters.has('author')
+                          ? 'bg-blue-600 text-white border-blue-600 hover:bg-blue-700'
+                          : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}">
+                  ${i18n.roleAuthor}
+                  ${roleFilters.has('author') ? '<span class="ml-1">&times;</span>' : ''}
+                </button>
+                <button onclick="toggleRoleFilter('reviewer')"
+                        class="px-3 py-1.5 text-sm rounded-full border transition-colors ${roleFilters.has('reviewer')
+                          ? 'bg-purple-600 text-white border-purple-600 hover:bg-purple-700'
+                          : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}">
+                  ${i18n.roleReviewer}
+                  ${roleFilters.has('reviewer') ? '<span class="ml-1">&times;</span>' : ''}
+                </button>
+                <button onclick="toggleRoleFilter('assignee')"
+                        class="px-3 py-1.5 text-sm rounded-full border transition-colors ${roleFilters.has('assignee')
+                          ? 'bg-orange-600 text-white border-orange-600 hover:bg-orange-700'
+                          : 'bg-white text-gray-700 border-gray-300 hover:bg-gray-50'}">
+                  ${i18n.roleAssignee}
+                  ${roleFilters.has('assignee') ? '<span class="ml-1">&times;</span>' : ''}
+                </button>
+              </div>
+            </div>
+
+            <!-- Clear All Button -->
+            ${(branchFilters.size > 0 || statusFilters.size > 0 || roleFilters.size > 0) ? `
+              <div class="pt-2">
+                <button onclick="clearAllFilters()" class="px-3 py-1.5 text-red-600 hover:text-red-800 hover:bg-red-50 rounded text-sm font-medium transition-colors">
+                  ${i18n.clearFilters}
+                </button>
+              </div>
+            ` : ''}
+          </div>
+
+          <!-- Active Filters Summary (shown when collapsed) -->
+          ${!isFiltersExpanded && (branchFilters.size > 0 || statusFilters.size > 0 || roleFilters.size > 0) ? `
+            <div class="flex flex-wrap gap-2 items-center mt-3 pt-3 border-t">
+              <span class="text-sm text-gray-500">${i18n.activeFilters}:</span>
+              ${Array.from(branchFilters).map(b => `<span class="px-2 py-1 bg-cyan-100 text-cyan-800 text-xs rounded-full">${b}</span>`).join('')}
+              ${Array.from(statusFilters).map(s => `<span class="px-2 py-1 bg-gray-100 text-gray-800 text-xs rounded-full">${s}</span>`).join('')}
+              ${Array.from(roleFilters).map(r => `<span class="px-2 py-1 bg-purple-100 text-purple-800 text-xs rounded-full">${r}</span>`).join('')}
+              <button onclick="clearAllFilters()" class="text-red-600 hover:text-red-800 text-xs font-medium ml-2">
+                ${i18n.clearFilters}
+              </button>
+            </div>
+          ` : ''}
+        </div>
+
+        <!-- Loading CI Status Indicator -->
+        <div id="loadingIndicator" class="${prs.some(pr => pr.e2eStatus === 'loading') ? '' : 'hidden'} bg-blue-50 border border-blue-200 rounded-lg p-3 mb-4 flex items-center gap-3">
+          <div class="spinner" style="border-top-color: #3b82f6;"></div>
+          <span class="text-blue-700 text-sm">${i18n.loadingCIStatus}</span>
+        </div>
+
+        <!-- Sorting and Grouping Controls -->
+        <div class="bg-white rounded-lg shadow p-3 mb-4 flex flex-wrap items-center justify-between gap-4">
+          <!-- Sort By - Table-like column headers -->
+          <div class="flex items-center gap-1">
+            <span class="text-sm text-gray-500 mr-2">${i18n.sortBy}:</span>
+            <button onclick="handleSortClick('updatedAt')"
+                    class="flex items-center gap-1 px-3 py-1.5 text-sm rounded-md transition-colors ${sortBy === 'updatedAt' ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-600 hover:bg-gray-100'}">
+              ${i18n.sortUpdated}
+              ${sortBy === 'updatedAt' ? `<svg class="w-4 h-4 ${sortOrder === 'asc' ? '' : 'rotate-180'}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"/></svg>` : ''}
+            </button>
+            <button onclick="handleSortClick('createdAt')"
+                    class="flex items-center gap-1 px-3 py-1.5 text-sm rounded-md transition-colors ${sortBy === 'createdAt' ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-600 hover:bg-gray-100'}">
+              ${i18n.sortCreated}
+              ${sortBy === 'createdAt' ? `<svg class="w-4 h-4 ${sortOrder === 'asc' ? '' : 'rotate-180'}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"/></svg>` : ''}
+            </button>
+            <button onclick="handleSortClick('number')"
+                    class="flex items-center gap-1 px-3 py-1.5 text-sm rounded-md transition-colors ${sortBy === 'number' ? 'bg-blue-100 text-blue-700 font-medium' : 'text-gray-600 hover:bg-gray-100'}">
+              ${i18n.sortPRNumber}
+              ${sortBy === 'number' ? `<svg class="w-4 h-4 ${sortOrder === 'asc' ? '' : 'rotate-180'}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 15l7-7 7 7"/></svg>` : ''}
+            </button>
+          </div>
+
+          <!-- Group By Status Toggle - Beautiful Switch -->
+          <label class="flex items-center gap-3 cursor-pointer select-none">
+            <span class="text-sm text-gray-600">${i18n.groupByStatus}</span>
+            <button onclick="toggleGroupByStatus()" type="button" role="switch" aria-checked="${groupByStatus}"
+                    class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 ${groupByStatus ? 'bg-blue-600' : 'bg-gray-300'}">
+              <span class="inline-block h-4 w-4 transform rounded-full bg-white shadow-md transition-transform ${groupByStatus ? 'translate-x-6' : 'translate-x-1'}"></span>
+            </button>
+          </label>
+        </div>
+
+        <!-- Quick Filters -->
+        <div class="flex flex-wrap gap-2 mb-4">
+          <button onclick="filterPRs('all')" data-filter="all" class="filter-btn px-4 py-2 rounded-lg font-medium transition-colors ${currentFilter === 'all' ? 'bg-blue-600 hover:bg-blue-700 text-white' : 'bg-white text-gray-700 hover:bg-gray-100'}">
+            ${i18n.filterAll} (<span id="count-all">${prs.length}</span>)
+          </button>
+          <button onclick="filterPRs('potential-flakes')" data-filter="potential-flakes" class="filter-btn px-4 py-2 rounded-lg font-medium transition-colors ${currentFilter === 'potential-flakes' ? 'bg-yellow-500 hover:bg-yellow-600 text-white' : 'bg-white text-gray-700 hover:bg-gray-100'}">
+            ${i18n.filterPotentialFlakes} (<span id="count-potential-flakes">${potentialFlakesPRs.length}</span>)
+          </button>
+          <button onclick="filterPRs('other-failing')" data-filter="other-failing" class="filter-btn px-4 py-2 rounded-lg font-medium transition-colors ${currentFilter === 'other-failing' ? 'bg-orange-600 hover:bg-orange-700 text-white' : 'bg-white text-gray-700 hover:bg-gray-100'}">
+            ${i18n.filterOtherFailing} (<span id="count-other-failing">${otherFailingPRs.length}</span>)
+          </button>
+          <button onclick="filterPRs('mine')" data-filter="mine" class="filter-btn px-4 py-2 rounded-lg font-medium transition-colors ${currentFilter === 'mine' ? 'bg-blue-600 hover:bg-blue-700 text-white' : 'bg-white text-gray-700 hover:bg-gray-100'}">
+            ${i18n.filterMine} (<span id="count-mine">${prs.filter(pr => pr.isAuthor).length}</span>)
+          </button>
+          <button onclick="filterPRs('missing-labels')" data-filter="missing-labels" class="filter-btn px-4 py-2 rounded-lg font-medium transition-colors ${currentFilter === 'missing-labels' ? 'bg-purple-600 hover:bg-purple-700 text-white' : 'bg-white text-gray-700 hover:bg-gray-100'}">
+            ${i18n.filterMissingLabels} (<span id="count-missing-labels">${missingLabelsPRs.length}</span>)
+          </button>
+        </div>
+
+        <!-- Batch Actions -->
+        <div id="batchActions" class="bg-white rounded-lg shadow p-4 mb-4 flex flex-wrap items-center justify-between gap-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="text-sm text-gray-600 mr-2">${i18n.batchActions}:</span>
+            <button onclick="selectAllFailing()" class="px-3 py-1.5 bg-red-100 hover:bg-red-200 text-red-700 rounded text-sm font-medium transition-colors">
+              ${i18n.selectAllFailing}
+            </button>
+            <button onclick="selectAllVisible()" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium transition-colors">
+              ${i18n.selectAllVisible}
+            </button>
+            <button onclick="deselectAll()" class="px-3 py-1.5 bg-gray-100 hover:bg-gray-200 rounded text-sm font-medium transition-colors">
+              ${i18n.deselectAll}
+            </button>
+          </div>
+          <button onclick="retestSelected()" id="retestSelectedBtn" disabled class="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed text-white rounded-lg text-sm font-medium transition-colors flex items-center gap-2">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
+            </svg>
+            ${i18n.retestSelected} (<span id="selectedCount">0</span>)
+          </button>
+        </div>
+
+        <!-- PR List -->
+        <div id="prList" class="space-y-4">
+          ${renderPRListContent()}
+        </div>
+      `;
+
+      // Apply current filters after rendering
+      applyCurrentFilter();
+    }
+
+    // Render PR list content with optional grouping
+    function renderPRListContent() {
+      const sortedPRs = getSortedPRs();
+      // Filter PRs based on current filters
+      const filteredPRs = sortedPRs.filter(pr => matchesFilters(pr));
+
+      if (!groupByStatus) {
+        return `<div class="space-y-3">${filteredPRs.map(pr => renderPRCard(pr)).join('')}</div>`;
+      }
+
+      // Group PRs by status
+      const groups = {
+        failing: { label: i18n.groupFailing, prs: [], color: 'red', icon: '✗' },
+        success: { label: i18n.groupSuccess, prs: [], color: 'green', icon: '✓' },
+        pending: { label: i18n.groupPending, prs: [], color: 'yellow', icon: '◷' },
+        loading: { label: i18n.groupLoading, prs: [], color: 'blue', icon: '↻' },
+        other: { label: i18n.groupOther, prs: [], color: 'gray', icon: '?' }
+      };
+
+      filteredPRs.forEach(pr => {
+        if (pr.e2eStatus === 'failure') {
+          groups.failing.prs.push(pr);
+        } else if (pr.e2eStatus === 'success') {
+          groups.success.prs.push(pr);
+        } else if (pr.e2eStatus === 'loading') {
+          groups.loading.prs.push(pr);
+        } else if (isPending(pr)) {
+          groups.pending.prs.push(pr);
+        } else {
+          groups.other.prs.push(pr);
+        }
+      });
+
+      // Render groups - Order: Failing → Success → Pending → Loading → Other
+      let html = '';
+      const groupOrder = ['failing', 'success', 'pending', 'loading', 'other'];
+
+      const colorClasses = {
+        red: { header: 'bg-red-100 text-red-800 border-red-300', hover: 'hover:bg-red-50' },
+        green: { header: 'bg-green-100 text-green-800 border-green-300', hover: 'hover:bg-green-50' },
+        yellow: { header: 'bg-yellow-100 text-yellow-800 border-yellow-300', hover: 'hover:bg-yellow-50' },
+        blue: { header: 'bg-blue-100 text-blue-800 border-blue-300', hover: 'hover:bg-blue-50' },
+        gray: { header: 'bg-gray-100 text-gray-800 border-gray-300', hover: 'hover:bg-gray-50' }
+      };
+
+      groupOrder.forEach(groupKey => {
+        const group = groups[groupKey];
+        // Hide groups with 0 items
+        if (group.prs.length === 0) return;
+
+        const isCollapsed = collapsedGroups.has(groupKey);
+        const colors = colorClasses[group.color];
+
+        html += `
+          <div class="mb-4" data-group="${groupKey}">
+            <button onclick="toggleGroupCollapse('${groupKey}')"
+                    class="w-full flex items-center gap-2 p-2 rounded-lg border ${colors.header} ${colors.hover} transition-colors cursor-pointer">
+              <svg class="w-4 h-4 transition-transform ${isCollapsed ? '-rotate-90' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/>
+              </svg>
+              <span class="font-semibold">${group.icon} ${group.label}</span>
+              <span class="text-sm opacity-75">(${group.prs.length})</span>
+              <div class="flex-1"></div>
+              <span class="text-xs opacity-60">${isCollapsed ? 'Click to expand' : 'Click to collapse'}</span>
+            </button>
+            <div class="${isCollapsed ? 'hidden' : ''} mt-3 space-y-3">
+              ${group.prs.map(pr => renderPRCard(pr)).join('')}
+            </div>
+          </div>
+        `;
+      });
+
+      // Show message if no PRs match filters
+      if (html === '' && prs.length > 0) {
+        html = `
+          <div class="text-center py-8 text-gray-500">
+            <svg class="w-12 h-12 mx-auto mb-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.172 16.172a4 4 0 015.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <p>${i18n.noResults}</p>
+            <button onclick="clearAllFilters()" class="mt-2 text-blue-600 hover:underline">${i18n.clearFilters}</button>
+          </div>
+        `;
+      }
+
+      return html;
+    }
+
+    // Get sorted PRs
+    function getSortedPRs() {
+      return [...prs].sort((a, b) => {
+        let aVal, bVal;
+
+        switch (sortBy) {
+          case 'updatedAt':
+            aVal = new Date(a.updatedAt || 0).getTime();
+            bVal = new Date(b.updatedAt || 0).getTime();
+            break;
+          case 'createdAt':
+            aVal = new Date(a.createdAt || 0).getTime();
+            bVal = new Date(b.createdAt || 0).getTime();
+            break;
+          case 'number':
+            aVal = a.number;
+            bVal = b.number;
+            break;
+          default:
+            aVal = new Date(a.updatedAt || 0).getTime();
+            bVal = new Date(b.updatedAt || 0).getTime();
+        }
+
+        if (sortOrder === 'asc') {
+          return aVal - bVal;
+        } else {
+          return bVal - aVal;
+        }
+      });
+    }
+
+    // Render empty state
+    function renderEmptyState() {
+      return `
+        <div class="flex flex-col items-center justify-center py-16 text-center">
+          <svg class="w-16 h-16 text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
+          </svg>
+          <h2 class="text-xl font-bold text-gray-900 mb-2">${i18n.noPRsFound}</h2>
+          <p class="text-gray-600">${i18n.noPRsDescription}</p>
+        </div>
+      `;
+    }
+
+    // Get status styles
+    function getStatusStyles(status) {
+      switch (status) {
+        case 'success':
+          return { bg: 'bg-green-100', text: 'text-green-800', border: 'border-l-green-500', label: i18n.statusSuccess };
+        case 'failure':
+          return { bg: 'bg-red-100', text: 'text-red-800', border: 'border-l-red-500', label: i18n.statusFailure };
+        case 'pending':
+        case 'in_progress':
+        case 'queued':
+          return { bg: 'bg-yellow-100', text: 'text-yellow-800', border: 'border-l-yellow-500', label: i18n.statusPending };
+        case 'loading':
+          return { bg: 'bg-gray-100', text: 'text-gray-600', border: 'border-l-gray-300', label: i18n.statusLoading };
+        case 'aborted':
+          return { bg: 'bg-gray-100', text: 'text-gray-600', border: 'border-l-gray-400', label: i18n.statusAborted };
+        default:
+          return { bg: 'bg-gray-100', text: 'text-gray-600', border: 'border-l-gray-300', label: i18n.statusNotFound };
+      }
+    }
+
+    // Helper: Get unique key for a PR (handles multiple repos)
+    // Using :: as separator since it won't appear in repo names
+    function getPRKey(pr) {
+      return `${pr.number}::${pr.repo || 'console'}`;
+    }
+
+    // Helper: Parse prKey back to number and repo
+    function parsePRKey(prKey) {
+      const [prNumber, repo] = prKey.split('::');
+      return { prNumber: parseInt(prNumber), repo };
+    }
+
+    // Render individual PR card
+    function renderPRCard(pr) {
+      const styles = getStatusStyles(pr.e2eStatus);
+      const prKey = getPRKey(pr);
+      const isExpanded = expandedPRs.has(prKey);
+      const repo = pr.repo || 'console';
+
+      const roles = [];
+      // Show repo badge (different color for different repos)
+      if (repo !== 'console') {
+        roles.push(`<span class="px-2 py-0.5 bg-indigo-100 text-indigo-800 text-xs font-medium rounded">${repo}</span>`);
+      }
+      if (pr.isAuthor) roles.push(`<span class="px-2 py-0.5 bg-blue-100 text-blue-800 text-xs font-medium rounded">${i18n.roleAuthor}</span>`);
+      if (pr.isReviewer) roles.push(`<span class="px-2 py-0.5 bg-purple-100 text-purple-800 text-xs font-medium rounded">${i18n.roleReviewer}</span>`);
+      if (pr.isAssignee) roles.push(`<span class="px-2 py-0.5 bg-orange-100 text-orange-800 text-xs font-medium rounded">${i18n.roleAssignee}</span>`);
+
+      // Show base branch if not main
+      if (pr.baseBranch && pr.baseBranch !== 'main' && pr.baseBranch !== 'master') {
+        roles.push(`<span class="px-2 py-0.5 bg-cyan-100 text-cyan-800 text-xs font-medium rounded">${pr.baseBranch}</span>`);
+      }
+
+      // Label badges
+      const labels = [];
+      if (pr.hasLgtm) {
+        labels.push(`<span class="px-2 py-0.5 bg-green-100 text-green-800 text-xs font-medium rounded">lgtm</span>`);
+      } else if (pr.isAuthor) {
+        labels.push(`<span class="px-2 py-0.5 bg-red-100 text-red-600 text-xs font-medium rounded border border-red-200">needs lgtm</span>`);
+      }
+      if (pr.hasApproved) {
+        labels.push(`<span class="px-2 py-0.5 bg-green-100 text-green-800 text-xs font-medium rounded">approved</span>`);
+      } else if (pr.isAuthor) {
+        labels.push(`<span class="px-2 py-0.5 bg-red-100 text-red-600 text-xs font-medium rounded border border-red-200">needs approved</span>`);
+      }
+      if (pr.hasVerified) {
+        labels.push(`<span class="px-2 py-0.5 bg-green-100 text-green-800 text-xs font-medium rounded">verified</span>`);
+      } else if (pr.isAuthor) {
+        labels.push(`<span class="px-2 py-0.5 bg-red-100 text-red-600 text-xs font-medium rounded border border-red-200">needs verified</span>`);
+      }
+
+      // Other failing CI jobs
+      const otherFailingJobs = pr.otherFailingJobs || [];
+
+      return `
+        <div class="bg-white rounded-lg shadow border-l-4 ${styles.border}" data-pr="${pr.number}" data-repo="${repo}" data-prkey="${prKey}" data-status="${pr.e2eStatus}" data-author="${pr.isAuthor}">
+          <div class="p-4">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div class="flex items-start gap-3 flex-1 min-w-0">
+                <input type="checkbox" class="mt-1.5 w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                       id="select-${prKey}"
+                       ${selectedPRs.has(prKey) ? 'checked' : ''}
+                       onchange="togglePRSelection('${prKey}')">
+                <div class="flex-1 min-w-0">
+                  <a href="${pr.url}" target="_blank" class="text-blue-600 hover:text-blue-800 font-medium hover:underline block truncate">
+                    ${i18n.prNumber}${pr.number}: ${escapeHtml(pr.title)}
+                  </a>
+                  <div class="flex flex-wrap items-center gap-2 mt-1">
+                    <span class="text-sm text-gray-500">${i18n.by} ${pr.author}</span>
+                    ${roles.join('')}
+                  </div>
+                  ${labels.length > 0 ? `
+                    <div class="flex flex-wrap items-center gap-1.5 mt-2">
+                      ${labels.join('')}
+                    </div>
+                  ` : ''}
+                  ${otherFailingJobs.length > 0 ? `
+                    <div class="flex flex-wrap items-center gap-1.5 mt-2">
+                      <span class="text-xs text-gray-500">Other failing:</span>
+                      ${otherFailingJobs.map(job => `
+                        <a href="${job.url}" target="_blank"
+                           class="px-2 py-0.5 bg-orange-100 text-orange-700 text-xs font-medium rounded hover:bg-orange-200 transition-colors"
+                           title="${escapeHtml(job.name)}">
+                          ${escapeHtml(job.name.length > 30 ? job.name.substring(0, 30) + '...' : job.name)}
+                        </a>
+                      `).join('')}
+                    </div>
+                  ` : ''}
+                </div>
+              </div>
+              <div class="flex items-center gap-2 flex-shrink-0">
+                <span class="px-2.5 py-1 ${styles.bg} ${styles.text} text-xs font-medium rounded-full flex items-center gap-1">
+                  ${pr.e2eStatus === 'loading' ? '<div class="spinner" style="width: 12px; height: 12px; border-width: 2px;"></div>' : ''}
+                  ${styles.label}
+                </span>
+                ${((pr.e2eStatus === 'failure' || otherFailingJobs.length > 0) && !isPending(pr)) ? `
+                  <button onclick="triggerRetest(${pr.number}, '${repo}')" class="px-3 py-1 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded transition-colors">
+                    ${i18n.retestButton}
+                  </button>
+                ` : ''}
+                <button onclick="toggleDetails('${prKey}')" class="px-3 py-1 text-blue-600 hover:text-blue-800 text-sm font-medium hover:bg-blue-50 rounded transition-colors">
+                  ${isExpanded ? i18n.hideDetails : i18n.viewDetails}
+                </button>
+              </div>
+            </div>
+          </div>
+          ${isExpanded ? `
+            <div class="border-t bg-gray-50 p-4" id="details-${prKey}">
+              ${prDetails[prKey] ? renderPRDetails(prKey) : `
+                <div class="flex items-center gap-2 text-gray-500">
+                  <div class="spinner"></div>
+                  <span>${i18n.loadingDetails}</span>
+                </div>
+              `}
+            </div>
+          ` : ''}
+        </div>
+      `;
+    }
+
+    // Render PR details (failing tests and job history)
+    function renderPRDetails(prKey) {
+      const details = prDetails[prKey];
+      if (!details) return '';
+
+      let html = '';
+
+      // Job History
+      if (details.jobRuns && details.jobRuns.length > 0) {
+        html += `
+          <div class="mb-4">
+            <h4 class="font-medium text-gray-900 mb-2">${i18n.jobHistory}</h4>
+            <div class="flex flex-wrap gap-2">
+              ${details.jobRuns.map((run, index) => {
+                const runStyles = getStatusStyles(run.status);
+                return `
+                  <a href="${run.prowUrl}" target="_blank"
+                     class="inline-flex items-center gap-1 px-3 py-1.5 ${runStyles.bg} ${runStyles.text} text-sm font-medium rounded hover:opacity-80 transition-opacity">
+                    Run ${index + 1}: ${run.status.charAt(0).toUpperCase() + run.status.slice(1)}
+                  </a>
+                `;
+              }).join('')}
+            </div>
+          </div>
+        `;
+      } else {
+        html += `<p class="text-gray-500 text-sm mb-4">${i18n.noJobHistory}</p>`;
+      }
+
+      // Failing Specs
+      if (details.failingTests && details.failingTests.specs && details.failingTests.specs.length > 0) {
+        html += `
+          <div class="bg-red-50 border border-red-200 rounded-lg p-4">
+            <h4 class="font-medium text-red-900 mb-2">${i18n.failingTests} (${details.failingTests.count} total)</h4>
+            <ul class="space-y-2">
+              ${details.failingTests.specs.map(item => `
+                <li class="flex items-center justify-between text-sm bg-white rounded px-3 py-2 border border-red-100">
+                  <span class="font-mono text-red-800">${escapeHtml(item.spec)}</span>
+                  <span class="bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs font-medium">${item.count > 0 ? item.count + ' failed' : 'failed'}</span>
+                </li>
+              `).join('')}
+            </ul>
+          </div>
+        `;
+      } else if (details.jobRuns && details.jobRuns.length > 0) {
+        // We have job runs but no parsed failures
+        const latestRun = details.jobRuns[0];
+        if (latestRun.status === 'failure') {
+          html += `
+            <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+              <p class="text-yellow-800 text-sm mb-2">${i18n.noFailingTests}</p>
+              <p class="text-yellow-700 text-xs">The CI job failed but no Cypress test failures were found in the logs. This might be an infrastructure failure or a different type of error.</p>
+              <a href="${latestRun.buildLogUrl}" target="_blank" class="inline-block mt-2 text-xs text-blue-600 hover:underline">View raw build log</a>
+            </div>
+          `;
+        } else if (latestRun.status === 'success') {
+          html += `<p class="text-green-600 text-sm">Latest CI run passed successfully.</p>`;
+        }
+      } else {
+        html += `<p class="text-gray-500 text-sm">No e2e-gcp-console job runs found for this PR.</p>`;
+      }
+
+      return html;
+    }
+
+    // Toggle PR details
+    async function toggleDetails(prKey) {
+      if (expandedPRs.has(prKey)) {
+        expandedPRs.delete(prKey);
+      } else {
+        expandedPRs.add(prKey);
+        if (!prDetails[prKey]) {
+          // Re-render the card to show loading state, then fetch details
+          rerenderPRCard(prKey);
+          await loadPRDetails(prKey);
+        }
+      }
+      rerenderPRCard(prKey);
+    }
+
+    // Re-render a single PR card (works regardless of groupByStatus)
+    function rerenderPRCard(prKey) {
+      const { prNumber, repo } = parsePRKey(prKey);
+      const pr = prs.find(p => p.number === prNumber && p.repo === repo);
+      if (!pr) return;
+
+      const card = document.querySelector(`[data-prkey="${prKey}"]`);
+      if (card) {
+        card.outerHTML = renderPRCard(pr);
+      }
+    }
+
+    // Load PR CI details
+    async function loadPRDetails(prKey) {
+      const { prNumber, repo } = parsePRKey(prKey);
+
+      try {
+        // Find the PR to get its base branch
+        const pr = prs.find(p => p.number === prNumber && p.repo === repo);
+        const baseBranch = pr?.baseBranch || 'main';
+
+        const response = await fetch(`/api/ci-log/${prNumber}?baseBranch=${encodeURIComponent(baseBranch)}&repo=${encodeURIComponent(repo)}`);
+        if (!response.ok) throw new Error('Failed to fetch CI details');
+        prDetails[prKey] = await response.json();
+        rerenderPRCard(prKey);
+      } catch (error) {
+        console.error(`Error loading details for PR #${prNumber}:`, error);
+        prDetails[prKey] = { jobRuns: [], failingTests: { specs: [], count: 0 } };
+        rerenderPRCard(prKey);
+      }
+    }
+
+    // Filter PRs
+    function filterPRs(filter) {
+      currentFilter = filter;
+
+      // Re-render the entire list to update groups
+      if (groupByStatus) {
+        const prListEl = document.getElementById('prList');
+        if (prListEl) {
+          prListEl.innerHTML = renderPRListContent();
+        }
+      }
+
+      // Update button styles - each filter has its own active color and hover
+      const filterStyles = {
+        'all': { bg: 'bg-blue-600', hover: 'hover:bg-blue-700' },
+        'failing': { bg: 'bg-red-600', hover: 'hover:bg-red-700' },
+        'potential-flakes': { bg: 'bg-yellow-500', hover: 'hover:bg-yellow-600' },
+        'other-failing': { bg: 'bg-orange-600', hover: 'hover:bg-orange-700' },
+        'mine': { bg: 'bg-blue-600', hover: 'hover:bg-blue-700' },
+        'missing-labels': { bg: 'bg-purple-600', hover: 'hover:bg-purple-700' }
+      };
+
+      document.querySelectorAll('.filter-btn').forEach(btn => {
+        const btnFilter = btn.dataset.filter;
+        const isActive = btnFilter === filter;
+
+        // Remove all possible colors
+        btn.classList.remove(
+          'bg-blue-600', 'bg-red-600', 'bg-purple-600', 'bg-yellow-500', 'bg-orange-600', 'text-white',
+          'hover:bg-blue-700', 'hover:bg-red-700', 'hover:bg-purple-700', 'hover:bg-yellow-600', 'hover:bg-orange-700',
+          'bg-white', 'text-gray-700', 'hover:bg-gray-100'
+        );
+
+        if (isActive) {
+          const style = filterStyles[btnFilter] || filterStyles['all'];
+          btn.classList.add(style.bg, style.hover, 'text-white');
+        } else {
+          btn.classList.add('bg-white', 'text-gray-700', 'hover:bg-gray-100');
+        }
+      });
+
+      if (!groupByStatus) {
+        applyCurrentFilter();
+      }
+      updateFilteredCounts();
+    }
+
+    // Toggle filters panel visibility
+    function toggleFiltersPanel() {
+      isFiltersExpanded = !isFiltersExpanded;
+      localStorage.setItem('filtersExpanded', isFiltersExpanded);
+      renderPRList();
+    }
+
+    // Handle sort click - toggle order if same column, otherwise switch column
+    function handleSortClick(column) {
+      if (sortBy === column) {
+        // Same column - toggle order
+        sortOrder = sortOrder === 'desc' ? 'asc' : 'desc';
+      } else {
+        // Different column - switch to it with desc order
+        sortBy = column;
+        sortOrder = 'desc';
+      }
+      localStorage.setItem('sortBy', sortBy);
+      localStorage.setItem('sortOrder', sortOrder);
+      renderPRList();
+    }
+
+    // Toggle group by status
+    function toggleGroupByStatus() {
+      groupByStatus = !groupByStatus;
+      localStorage.setItem('groupByStatus', groupByStatus);
+      renderPRList();
+    }
+
+    // Toggle group collapse
+    function toggleGroupCollapse(groupKey) {
+      if (collapsedGroups.has(groupKey)) {
+        collapsedGroups.delete(groupKey);
+      } else {
+        collapsedGroups.add(groupKey);
+      }
+      // Don't persist "loading" group state - it should always be expanded on page load
+      const toSave = [...collapsedGroups].filter(g => g !== 'loading');
+      localStorage.setItem('collapsedGroups', JSON.stringify(toSave));
+      renderPRList();
+    }
+
+    // Re-render PR list content (for filter changes when grouping is enabled)
+    function reRenderPRList() {
+      if (groupByStatus) {
+        const prListEl = document.getElementById('prList');
+        if (prListEl) {
+          prListEl.innerHTML = renderPRListContent();
+        }
+        updateFilteredCounts();
+      } else {
+        applyCurrentFilter();
+        updateFilteredCounts();
+      }
+    }
+
+    // Advanced filter handlers
+    function handleSearch(value) {
+      searchQuery = value.toLowerCase().trim();
+      reRenderPRList();
+    }
+
+    function clearSearch() {
+      searchQuery = '';
+      const input = document.getElementById('searchInput');
+      if (input) input.value = '';
+      reRenderPRList();
+    }
+
+    function toggleBranchFilter(value) {
+      if (branchFilters.has(value)) {
+        branchFilters.delete(value);
+      } else {
+        branchFilters.add(value);
+      }
+      renderPRList();
+    }
+
+    function toggleStatusFilter(value) {
+      if (statusFilters.has(value)) {
+        statusFilters.delete(value);
+      } else {
+        statusFilters.add(value);
+      }
+      renderPRList();
+    }
+
+    function toggleRoleFilter(value) {
+      if (roleFilters.has(value)) {
+        roleFilters.delete(value);
+      } else {
+        roleFilters.add(value);
+      }
+      renderPRList();
+    }
+
+    function clearAllFilters() {
+      searchQuery = '';
+      branchFilters.clear();
+      statusFilters.clear();
+      roleFilters.clear();
+      currentFilter = 'all';
+      renderPRList();
+    }
+
+    // Update filter tab counts based on currently visible PRs
+    function updateFilteredCounts() {
+      const visiblePRs = prs.filter(pr => matchesAdvancedFilters(pr));
+
+      const allCount = document.getElementById('count-all');
+      const potentialFlakesCount = document.getElementById('count-potential-flakes');
+      const otherFailingCount = document.getElementById('count-other-failing');
+      const mineCount = document.getElementById('count-mine');
+      const missingLabelsCount = document.getElementById('count-missing-labels');
+
+      if (allCount) allCount.textContent = visiblePRs.length;
+      // Potential flakes: e2e failure but NO other failing jobs
+      if (potentialFlakesCount) potentialFlakesCount.textContent = visiblePRs.filter(pr => pr.e2eStatus === 'failure' && !(pr.otherFailingJobs || []).length).length;
+      if (otherFailingCount) otherFailingCount.textContent = visiblePRs.filter(pr => (pr.otherFailingJobs || []).length > 0).length;
+      if (mineCount) mineCount.textContent = visiblePRs.filter(pr => pr.isAuthor).length;
+      if (missingLabelsCount) missingLabelsCount.textContent = visiblePRs.filter(pr => isMissingLabels(pr)).length;
+
+      // Hide loading indicator if no PRs are still loading
+      const loadingIndicator = document.getElementById('loadingIndicator');
+      if (loadingIndicator) {
+        const stillLoading = prs.some(pr => pr.e2eStatus === 'loading');
+        loadingIndicator.classList.toggle('hidden', !stillLoading);
+      }
+    }
+
+    // Check if PR matches advanced filters only (not quick filter buttons)
+    function matchesAdvancedFilters(pr) {
+      // Search filter
+      if (searchQuery) {
+        const searchLower = searchQuery.toLowerCase();
+        const matchesSearch =
+          pr.number.toString().includes(searchLower) ||
+          pr.title.toLowerCase().includes(searchLower) ||
+          pr.author.toLowerCase().includes(searchLower);
+        if (!matchesSearch) return false;
+      }
+
+      // Branch filter (multi-select - if any selected, PR must match one)
+      if (branchFilters.size > 0 && !branchFilters.has(pr.baseBranch || 'main')) {
+        return false;
+      }
+
+      // Status filter (multi-select)
+      if (statusFilters.size > 0) {
+        const prStatus = pr.e2eStatus === 'failure' ? 'failure' :
+                        isPending(pr) ? 'pending' :
+                        pr.e2eStatus === 'success' ? 'success' : null;
+        if (!prStatus || !statusFilters.has(prStatus)) return false;
+      }
+
+      // Role filter (multi-select)
+      if (roleFilters.size > 0) {
+        const hasMatchingRole =
+          (roleFilters.has('author') && pr.isAuthor) ||
+          (roleFilters.has('reviewer') && pr.isReviewer) ||
+          (roleFilters.has('assignee') && pr.isAssignee);
+        if (!hasMatchingRole) return false;
+      }
+
+      return true;
+    }
+
+    // Check if PR matches all active filters
+    function matchesFilters(pr) {
+      // First check advanced filters
+      if (!matchesAdvancedFilters(pr)) return false;
+
+      // Quick filter buttons
+      switch (currentFilter) {
+        case 'failing':
+          if (pr.e2eStatus !== 'failure') return false;
+          break;
+        case 'potential-flakes':
+          // e2e failures with NO other failing jobs (likely just flaky tests)
+          if (pr.e2eStatus !== 'failure' || (pr.otherFailingJobs || []).length > 0) return false;
+          break;
+        case 'other-failing':
+          // PRs with other CI jobs failing (not e2e)
+          if (!(pr.otherFailingJobs || []).length) return false;
+          break;
+        case 'mine':
+          if (!pr.isAuthor) return false;
+          break;
+        case 'missing-labels':
+          if (!isMissingLabels(pr)) return false;
+          break;
+      }
+
+      return true;
+    }
+
+    // Apply current filter to cards
+    function applyCurrentFilter() {
+      let visibleCount = 0;
+
+      document.querySelectorAll('[data-prkey]').forEach(card => {
+        const prKey = card.dataset.prkey;
+        const { prNumber, repo } = parsePRKey(prKey);
+        const pr = prs.find(p => p.number === prNumber && p.repo === repo);
+        if (!pr) return;
+
+        const show = matchesFilters(pr);
+        card.style.display = show ? 'block' : 'none';
+        if (show) visibleCount++;
+      });
+
+      // Update filter counts
+      updateFilteredCounts();
+
+      // Show/hide no results message
+      let noResultsEl = document.getElementById('noResultsMessage');
+      if (visibleCount === 0 && prs.length > 0) {
+        if (!noResultsEl) {
+          const prList = document.getElementById('prList');
+          if (prList) {
+            prList.insertAdjacentHTML('beforeend', `
+              <div id="noResultsMessage" class="text-center py-8 text-gray-500">
+                <svg class="w-12 h-12 mx-auto mb-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9.172 16.172a4 4 0 015.656 0M9 10h.01M15 10h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                </svg>
+                <p>${i18n.noResults}</p>
+                <button onclick="clearAllFilters()" class="mt-2 text-blue-600 hover:underline">${i18n.clearFilters}</button>
+              </div>
+            `);
+          }
+        }
+      } else if (noResultsEl) {
+        noResultsEl.remove();
+      }
+    }
+
+    // Toggle PR selection
+    function togglePRSelection(prKey) {
+      if (selectedPRs.has(prKey)) {
+        selectedPRs.delete(prKey);
+      } else {
+        selectedPRs.add(prKey);
+      }
+      updateSelectedCount();
+    }
+
+    // Select all visible failing PRs (respects current filters)
+    function selectAllFailing() {
+      prs.filter(pr => pr.e2eStatus === 'failure' && matchesFilters(pr)).forEach(pr => {
+        const prKey = getPRKey(pr);
+        selectedPRs.add(prKey);
+        const checkbox = document.getElementById(`select-${prKey}`);
+        if (checkbox) checkbox.checked = true;
+      });
+      updateSelectedCount();
+    }
+
+    // Select all visible PRs (based on current filter)
+    function selectAllVisible() {
+      document.querySelectorAll('[data-prkey]').forEach(card => {
+        if (card.style.display !== 'none') {
+          const prKey = card.dataset.prkey;
+          selectedPRs.add(prKey);
+          const checkbox = document.getElementById(`select-${prKey}`);
+          if (checkbox) checkbox.checked = true;
+        }
+      });
+      updateSelectedCount();
+    }
+
+    // Deselect all PRs
+    function deselectAll() {
+      selectedPRs.forEach(prKey => {
+        const checkbox = document.getElementById(`select-${prKey}`);
+        if (checkbox) checkbox.checked = false;
+      });
+      selectedPRs.clear();
+      updateSelectedCount();
+    }
+
+    // Update selected count display
+    function updateSelectedCount() {
+      const countEl = document.getElementById('selectedCount');
+      const btn = document.getElementById('retestSelectedBtn');
+      if (countEl) countEl.textContent = selectedPRs.size;
+      if (btn) btn.disabled = selectedPRs.size === 0;
+    }
+
+    // Trigger retest for single PR
+    async function triggerRetest(prNumber, repo = 'console') {
+      try {
+        const response = await fetch(`/api/retest/${prNumber}?repo=${encodeURIComponent(repo)}`, { method: 'POST' });
+        if (!response.ok) throw new Error('Failed to trigger retest');
+
+        // Update PR status to pending immediately
+        const prIndex = prs.findIndex(p => p.number === prNumber && p.repo === repo);
+        if (prIndex !== -1) {
+          prs[prIndex].e2eStatus = 'pending';
+          const prKey = getPRKey(prs[prIndex]);
+          // Re-render the card or the entire list if grouping is enabled
+          if (groupByStatus) {
+            const prListEl = document.getElementById('prList');
+            if (prListEl) {
+              prListEl.innerHTML = renderPRListContent();
+            }
+          } else {
+            rerenderPRCard(prKey);
+          }
+          updateFilterCounts();
+        }
+
+        showAlert(`${i18n.retestTriggered}${prNumber}`, 'success');
+      } catch (error) {
+        console.error(`Error triggering retest for PR #${prNumber}:`, error);
+        showAlert(`${i18n.retestFailed}${prNumber}`, 'error');
+      }
+    }
+
+    // Retest selected PRs
+    async function retestSelected() {
+      if (selectedPRs.size === 0) return;
+
+      try {
+        // Convert prKeys to { prNumber, repo } objects
+        const prsToRetest = Array.from(selectedPRs).map(prKey => {
+          return parsePRKey(prKey);
+        });
+
+        const response = await fetch('/api/retest-batch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ prs: prsToRetest })
+        });
+
+        if (!response.ok) throw new Error('Batch retest failed');
+
+        const result = await response.json();
+        const succeeded = result.results.filter(r => r.success).length;
+        const failed = result.results.filter(r => !r.success).length;
+
+        // Update status to pending for successful retests
+        result.results.filter(r => r.success).forEach(r => {
+          const prIndex = prs.findIndex(p => p.number === r.prNumber && p.repo === r.repo);
+          if (prIndex !== -1) {
+            prs[prIndex].e2eStatus = 'pending';
+          }
+        });
+
+        // Re-render appropriately
+        if (groupByStatus) {
+          const prListEl = document.getElementById('prList');
+          if (prListEl) {
+            prListEl.innerHTML = renderPRListContent();
+          }
+        } else {
+          result.results.filter(r => r.success).forEach(r => {
+            const prKey = `${r.prNumber}::${r.repo}`;
+            rerenderPRCard(prKey);
+          });
+        }
+        updateFilterCounts();
+
+        showAlert(`${i18n.batchRetestComplete}: ${succeeded} succeeded, ${failed} failed`,
+                  failed > 0 ? 'warning' : 'success');
+
+        deselectAll();
+      } catch (error) {
+        console.error('Error in batch retest:', error);
+        showAlert(i18n.retestFailed, 'error');
+      }
+    }
+
+    // Show alert notification
+    function showAlert(message, type = 'info') {
+      const container = document.getElementById('alertContainer');
+      const alertId = `alert-${Date.now()}`;
+
+      const colors = {
+        success: 'bg-green-500',
+        error: 'bg-red-500',
+        warning: 'bg-yellow-500',
+        info: 'bg-blue-500'
+      };
+
+      const alertHtml = `
+        <div id="${alertId}" class="flex items-center gap-3 ${colors[type]} text-white px-4 py-3 rounded-lg shadow-lg animate-fade-in">
+          <span class="flex-1">${message}</span>
+          <button onclick="document.getElementById('${alertId}').remove()" class="text-white/80 hover:text-white">
+            <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+            </svg>
+          </button>
+        </div>
+      `;
+
+      container.insertAdjacentHTML('beforeend', alertHtml);
+
+      // Auto-dismiss after 5 seconds
+      setTimeout(() => {
+        const alert = document.getElementById(alertId);
+        if (alert) alert.remove();
+      }, 5000);
+    }
+
+    // Escape HTML to prevent XSS
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Initialize on page load
+    document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
