@@ -6,6 +6,12 @@
 
 A web application for managing and resolving flaky CI tests in OpenShift Console repositories. It helps developers quickly identify failing PRs, view test details, and trigger retests.
 
+<p align="center">
+  <img src="./sample.png" alt="sample-UI">
+</p>
+
+
+
 ## Features
 
 - **GitHub OAuth Authentication** - Secure login with your GitHub account
