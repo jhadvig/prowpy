@@ -1,4 +1,8 @@
 # Prowpy
+<p align="center">
+  <img src="./prowpy.png" alt="Prowpy Logo" width="260">
+</p>
+
 
 A web application for managing and resolving flaky CI tests in OpenShift Console repositories. It helps developers quickly identify failing PRs, view test details, and trigger retests.
 
