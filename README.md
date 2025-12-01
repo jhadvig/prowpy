@@ -141,3 +141,9 @@ flaky-resolver/
 ## License
 
 MIT
+
+
+## Disclaimer
+This project is provided as-is, without warranty of any kind. It is intended for educational and demonstration purposes only and should not be used in production environments without further review. Please ensure you comply with all applicable policies and terms of service when using this tool with external APIs.
+
+**Note:** Much of the codebase was generated with assistance from Claude Code.
