@@ -665,6 +665,85 @@ function parseCypressFailures(logContent) {
   };
 }
 
+// API: Get screenshots for a spec
+app.get('/api/screenshots/:prNumber/:runId', async (req, res) => {
+  const { prNumber, runId } = req.params;
+  const { spec, repo = 'console', ciJobName } = req.query;
+
+  if (!spec || !ciJobName) {
+    return res.status(400).json({ error: 'Missing spec or ciJobName parameter' });
+  }
+
+  // Construct the gcsweb URL for the screenshots directory (with trailing slash)
+  const gcsRepoPath = `openshift_${repo}`;
+  const jobSuffix = repo === 'console' ? 'e2e-gcp-console' : 'e2e';
+  const screenshotsBaseUrl = `https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/test-platform-results/pr-logs/pull/${gcsRepoPath}/${prNumber}/${ciJobName}/${runId}/artifacts/${jobSuffix}/test/artifacts/gui_test_screenshots/cypress/screenshots/${spec}/`;
+
+  console.log(`Fetching screenshots from: ${screenshotsBaseUrl}`);
+
+  try {
+    // Fetch the directory listing from gcsweb
+    const response = await axios.get(screenshotsBaseUrl, {
+      timeout: 30000,
+      headers: {
+        'User-Agent': 'Prowpy/1.0',
+        'Accept': 'text/html,application/xhtml+xml'
+      }
+    });
+
+    const html = response.data;
+
+    // Parse the HTML to extract screenshot links
+    // gcsweb shows directory listings with links like: <a href="/gcs/...filename.png">
+    // The href contains the full path, and the text might be just the filename or full path
+    const screenshots = [];
+    const seenUrls = new Set();
+
+    // Match any href that ends with .png (case insensitive)
+    // The gcsweb HTML structure: <a href="/gcs/path/to/file.png">displayname</a>
+    const linkPattern = /<a\s+href="([^"]+\.png)"[^>]*>/gi;
+
+    let match;
+    while ((match = linkPattern.exec(html)) !== null) {
+      const href = match[1];
+
+      // Build full URL - href is typically absolute path starting with /gcs/
+      let fullUrl;
+      if (href.startsWith('http')) {
+        fullUrl = href;
+      } else if (href.startsWith('/')) {
+        fullUrl = `https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com${href}`;
+      } else {
+        fullUrl = `${screenshotsBaseUrl}${href}`;
+      }
+
+      // Avoid duplicates
+      if (seenUrls.has(fullUrl)) continue;
+      seenUrls.add(fullUrl);
+
+      // Extract filename from the href (last part of the path)
+      const filename = decodeURIComponent(href.split('/').pop() || 'screenshot.png');
+
+      screenshots.push({
+        name: filename,
+        url: fullUrl
+      });
+    }
+
+    console.log(`Found ${screenshots.length} screenshots for ${spec}`);
+    res.json({ screenshots });
+  } catch (error) {
+    console.error(`Error fetching screenshots for PR #${prNumber}:`, error.message);
+
+    // If directory doesn't exist, return empty array instead of error
+    if (error.response?.status === 404) {
+      return res.json({ screenshots: [] });
+    }
+
+    res.status(500).json({ error: 'Failed to fetch screenshots', details: error.message });
+  }
+});
+
 // Serve frontend
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));

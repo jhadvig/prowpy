@@ -52,6 +52,24 @@
     <div id="appContent"></div>
   </main>
 
+  <!-- Screenshots Modal -->
+  <div id="screenshotsModal" class="fixed inset-0 z-50 hidden">
+    <div class="bg-black/50 absolute inset-0" onclick="closeScreenshotsModal()"></div>
+    <div class="relative max-w-5xl mx-auto mt-10 mb-10 bg-white rounded-lg shadow-2xl overflow-hidden max-h-[90vh] flex flex-col">
+      <div class="flex items-center justify-between p-4 border-b bg-gray-50">
+        <h3 id="screenshotsModalTitle" class="font-semibold text-gray-900"></h3>
+        <button onclick="closeScreenshotsModal()" class="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
+      <div id="screenshotsContent" class="p-4 overflow-y-auto flex-1">
+        <!-- Screenshots loaded here -->
+      </div>
+    </div>
+  </div>
+
   <script>
     // State
     let currentUser = null;
@@ -160,7 +178,13 @@
       groupLoading: 'Loading...',
       groupOther: 'Other',
       copyLink: 'Copy PR link',
-      linkCopied: 'PR link copied to clipboard'
+      linkCopied: 'PR link copied to clipboard',
+      videoRecording: 'Video Recording',
+      screenshots: 'Screenshots',
+      loadingScreenshots: 'Loading screenshots...',
+      noScreenshotsFound: 'No screenshots found',
+      closeModal: 'Close',
+      browseArtifacts: 'Browse Artifacts'
     };
 
     // Initialize app
@@ -909,10 +933,26 @@
       `;
     }
 
+    // Helper: Get CI job name for frontend
+    function getCIJobNameFrontend(repoName, baseBranch) {
+      const ciJobPrefix = repoName === 'console' ? 'pull-ci-openshift-console' : 'pull-ci-openshift-console-operator';
+      const branch = baseBranch === 'master' ? 'main' : baseBranch;
+      const jobSuffix = repoName === 'console' ? 'e2e-gcp-console' : 'e2e';
+      return `${ciJobPrefix}-${branch}-${jobSuffix}`;
+    }
+
     // Render PR details (failing tests and job history)
     function renderPRDetails(prKey) {
       const details = prDetails[prKey];
       if (!details) return '';
+
+      // Get PR info for constructing artifact URLs
+      const { prNumber, repo } = parsePRKey(prKey);
+      const pr = prs.find(p => p.number === prNumber && p.repo === repo);
+      const repoName = pr?.repo || 'console';
+      const baseBranch = pr?.baseBranch || 'main';
+      const ciJobName = getCIJobNameFrontend(repoName, baseBranch);
+      const latestRunId = details.jobRuns?.[0]?.runId || '';
 
       let html = '';
 
@@ -940,16 +980,52 @@
 
       // Failing Specs
       if (details.failingTests && details.failingTests.specs && details.failingTests.specs.length > 0) {
+        const artifactsRootUrl = getArtifactsRootUrl(prNumber, latestRunId, repoName, ciJobName);
         html += `
           <div class="bg-red-50 border border-red-200 rounded-lg p-4">
-            <h4 class="font-medium text-red-900 mb-2">${i18n.failingTests} (${details.failingTests.count} total)</h4>
+            <div class="flex items-center gap-3 mb-2">
+              <h4 class="font-medium text-red-900">${i18n.failingTests} (${details.failingTests.count} total)</h4>
+              <a href="${artifactsRootUrl}" target="_blank" title="${i18n.browseArtifacts}"
+                 class="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium text-gray-600 bg-white border border-gray-300 rounded hover:bg-gray-50 hover:text-gray-800 transition-colors">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"/>
+                </svg>
+                ${i18n.browseArtifacts}
+              </a>
+            </div>
             <ul class="space-y-2">
-              ${details.failingTests.specs.map(item => `
-                <li class="flex items-center justify-between text-sm bg-white rounded px-3 py-2 border border-red-100">
-                  <span class="font-mono text-red-800">${escapeHtml(item.spec)}</span>
-                  <span class="bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs font-medium">${item.count > 0 ? item.count + ' failed' : 'failed'}</span>
+              ${details.failingTests.specs.map(item => {
+                const videoUrl = getVideoUrl(prNumber, latestRunId, item.spec, repoName, ciJobName);
+                const buildLogUrl = details.jobRuns?.[0]?.buildLogUrl;
+                const logLinkUrl = getBuildLogUrlWithFragment(buildLogUrl, item.spec);
+                return `
+                <li class="flex items-center text-sm bg-white rounded px-3 py-2 border border-red-100">
+                  ${logLinkUrl ? `
+                    <a href="${logLinkUrl}" target="_blank" class="font-mono text-red-800 hover:text-red-600 hover:underline truncate" title="Jump to spec in build log">
+                      ${escapeHtml(item.spec)}
+                    </a>
+                  ` : `
+                    <span class="font-mono text-red-800 truncate">${escapeHtml(item.spec)}</span>
+                  `}
+                  <!-- Video button -->
+                  <a href="${videoUrl}" target="_blank" title="${i18n.videoRecording}"
+                     class="ml-2 p-1.5 text-gray-500 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors flex-shrink-0">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/>
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>
+                  </a>
+                  <!-- Screenshots button -->
+                  <button onclick="openScreenshotsModal(${prNumber}, '${latestRunId}', '${escapeHtml(item.spec)}', '${repoName}', '${ciJobName}')"
+                          title="${i18n.screenshots}"
+                          class="p-1.5 text-gray-500 hover:text-purple-600 hover:bg-purple-50 rounded transition-colors flex-shrink-0">
+                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+                    </svg>
+                  </button>
+                  <span class="ml-auto bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs font-medium flex-shrink-0">${item.count > 0 ? item.count + ' failed' : 'failed'}</span>
                 </li>
-              `).join('')}
+              `;}).join('')}
             </ul>
           </div>
         `;
@@ -1487,6 +1563,108 @@
         console.error('Failed to copy:', err);
         showAlert('Failed to copy link', 'error');
       });
+    }
+
+    // Get artifact base URL for videos/screenshots
+    function getArtifactBaseUrl(prNumber, runId, repoName = 'console', ciJobName) {
+      const gcsRepoPath = `openshift_${repoName}`;
+      const jobSuffix = repoName === 'console' ? 'e2e-gcp-console' : 'e2e';
+      return `https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/test-platform-results/pr-logs/pull/${gcsRepoPath}/${prNumber}/${ciJobName}/${runId}/artifacts/${jobSuffix}/test/artifacts/gui_test_screenshots/cypress`;
+    }
+
+    // Get artifacts root URL (browseable directory)
+    function getArtifactsRootUrl(prNumber, runId, repoName, ciJobName) {
+      return `${getArtifactBaseUrl(prNumber, runId, repoName, ciJobName)}/`;
+    }
+
+    // Get video URL for a spec
+    function getVideoUrl(prNumber, runId, specPath, repoName, ciJobName) {
+      const baseUrl = getArtifactBaseUrl(prNumber, runId, repoName, ciJobName);
+      return `${baseUrl}/videos/${specPath}.mp4`;
+    }
+
+    // Get screenshots directory URL for a spec
+    function getScreenshotsUrl(prNumber, runId, specPath, repoName, ciJobName) {
+      const baseUrl = getArtifactBaseUrl(prNumber, runId, repoName, ciJobName);
+      return `${baseUrl}/screenshots/${specPath}`;
+    }
+
+    // Get build log URL with text fragment to jump to spec failure
+    function getBuildLogUrlWithFragment(buildLogUrl, specPath) {
+      if (!buildLogUrl) return null;
+      // Cypress output format: "Spec Ran:     app/impersonate-user.cy.ts"
+      // This pattern appears only once per spec in the log
+      // Only encode `-` as %2D (it's a delimiter in text fragments), keep `/` as-is
+      const encodedSpec = specPath.replace(/-/g, '%2D');
+      // "Spec Ran:" + 5 spaces + spec name
+      return `${buildLogUrl}#:~:text=Spec%20Ran%3A%20%20%20%20%20${encodedSpec}`;
+    }
+
+    // Open screenshots modal
+    async function openScreenshotsModal(prNumber, runId, specPath, repoName, ciJobName) {
+      const modal = document.getElementById('screenshotsModal');
+      const content = document.getElementById('screenshotsContent');
+      const title = document.getElementById('screenshotsModalTitle');
+
+      title.textContent = `${i18n.screenshots}: ${specPath}`;
+      content.innerHTML = `
+        <div class="flex items-center justify-center py-8">
+          <div class="spinner mr-3"></div>
+          <span class="text-gray-600">${i18n.loadingScreenshots}</span>
+        </div>
+      `;
+      modal.classList.remove('hidden');
+      document.body.style.overflow = 'hidden';
+
+      try {
+        const response = await fetch(`/api/screenshots/${prNumber}/${runId}?spec=${encodeURIComponent(specPath)}&repo=${encodeURIComponent(repoName)}&ciJobName=${encodeURIComponent(ciJobName)}`);
+        if (!response.ok) throw new Error('Failed to fetch screenshots');
+
+        const data = await response.json();
+
+        if (data.screenshots && data.screenshots.length > 0) {
+          content.innerHTML = `
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              ${data.screenshots.map(screenshot => `
+                <div class="border rounded-lg overflow-hidden bg-gray-100">
+                  <a href="${screenshot.url}" target="_blank" class="block">
+                    <img src="${screenshot.url}" alt="${escapeHtml(screenshot.name)}" class="w-full h-auto" loading="lazy"/>
+                  </a>
+                  <div class="p-2 bg-white border-t">
+                    <p class="text-xs text-gray-600 truncate" title="${escapeHtml(screenshot.name)}">${escapeHtml(screenshot.name)}</p>
+                  </div>
+                </div>
+              `).join('')}
+            </div>
+          `;
+        } else {
+          content.innerHTML = `
+            <div class="text-center py-8 text-gray-500">
+              <svg class="w-12 h-12 mx-auto mb-3 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"/>
+              </svg>
+              <p>${i18n.noScreenshotsFound}</p>
+            </div>
+          `;
+        }
+      } catch (error) {
+        console.error('Error fetching screenshots:', error);
+        content.innerHTML = `
+          <div class="text-center py-8 text-red-500">
+            <svg class="w-12 h-12 mx-auto mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <p>Error loading screenshots</p>
+          </div>
+        `;
+      }
+    }
+
+    // Close screenshots modal
+    function closeScreenshotsModal() {
+      const modal = document.getElementById('screenshotsModal');
+      modal.classList.add('hidden');
+      document.body.style.overflow = '';
     }
 
     // Initialize on page load
