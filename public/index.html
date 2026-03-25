@@ -49,6 +49,7 @@
   <!-- Main Content -->
   <main class="max-w-7xl mx-auto px-4 py-6">
     <div id="alertContainer" class="fixed top-4 right-4 z-50 space-y-2"></div>
+    <div id="tabBar"></div>
     <div id="appContent"></div>
   </main>
 
@@ -101,6 +102,57 @@
     // Always expand loading group on page load
     collapsedGroups.delete('loading');
     localStorage.setItem('collapsedGroups', JSON.stringify([...collapsedGroups]));
+
+    // CI Watcher state
+    let currentTab = localStorage.getItem('currentTab') || 'prs';
+    let ciWatcherMeta = null;       // Phase 1 metadata (runs list, result summary)
+    let ciWatcherAnalysis = {};     // Phase 2 analysis keyed by buildId
+    let ciWatcherLoading = false;   // Phase 1 loading
+    let ciWatcherAnalyzing = false; // Phase 2 analyzing
+    let ciWatcherAnalyzedCount = 0;
+    let ciWatcherAnalyzeTotal = 0;
+    let ciWatcherRepo = localStorage.getItem('ciWatcherRepo') || 'console';
+    let ciWatcherBranch = localStorage.getItem('ciWatcherBranch') || 'main';
+    const _storedLimit = parseInt(localStorage.getItem('ciWatcherLimit'));
+    let ciWatcherLimit = [10, 25, 50, 100].includes(_storedLimit) ? _storedLimit : 25;
+    let ciWatcherExpandedRuns = new Set();
+    let ciWatcherExpandedSpecs = new Set();
+    const CI_WATCHER_BRANCHES = [
+      'main', 'release-4.21', 'release-4.20', 'release-4.19',
+      'release-4.18', 'release-4.17', 'release-4.16', 'release-4.15'
+    ];
+    const CI_WATCHER_REPOS = {
+      'console': {
+        label: 'console',
+        jobs: [
+          { suffix: 'e2e-gcp-console', label: 'E2E GCP Console' },
+          { suffix: 'analyze',         label: 'Analyze' },
+          { suffix: 'backend',         label: 'Backend' },
+          { suffix: 'frontend',        label: 'Frontend' },
+          { suffix: 'images',          label: 'Images' },
+          { suffix: 'okd-scos-images', label: 'OKD SCOS Images' },
+        ],
+      },
+      'console-operator': {
+        label: 'console-operator',
+        jobs: [
+          { suffix: 'e2e-aws-console',      label: 'E2E AWS Console' },
+          { suffix: 'e2e-aws-operator',      label: 'E2E AWS Operator' },
+          { suffix: 'e2e-azure-ovn-upgrade', label: 'E2E Azure Upgrade' },
+          { suffix: 'e2e-gcp-ovn',          label: 'E2E GCP OVN' },
+          { suffix: 'images',               label: 'Images' },
+          { suffix: 'okd-scos-images',      label: 'OKD SCOS Images' },
+          { suffix: 'unit',                 label: 'Unit' },
+          { suffix: 'verify',               label: 'Verify' },
+          { suffix: 'verify-deps',          label: 'Verify Deps' },
+        ],
+      },
+    };
+    function getRepoJobs() { return CI_WATCHER_REPOS[ciWatcherRepo]?.jobs || []; }
+    let ciWatcherJob = localStorage.getItem('ciWatcherJob') || getRepoJobs()[0]?.suffix || 'e2e-gcp-console';
+    if (!getRepoJobs().some(j => j.suffix === ciWatcherJob)) {
+      ciWatcherJob = getRepoJobs()[0]?.suffix || 'e2e-gcp-console';
+    }
 
     // i18n translations
     const i18n = {
@@ -207,6 +259,36 @@
     // Render the application
     function render() {
       renderUserSection();
+      renderTabBar();
+      renderContent();
+    }
+
+    // Render tab bar
+    function renderTabBar() {
+      const tabBar = document.getElementById('tabBar');
+      tabBar.innerHTML = `
+        <div class="flex gap-1 mb-6 border-b border-gray-200">
+          <button onclick="switchTab('prs')"
+                  class="px-5 py-2.5 text-sm font-medium border-b-2 transition-colors ${currentTab === 'prs'
+                    ? 'border-blue-600 text-blue-600'
+                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'}">
+            Pull Requests
+          </button>
+          <button onclick="switchTab('ci-watcher')"
+                  class="px-5 py-2.5 text-sm font-medium border-b-2 transition-colors ${currentTab === 'ci-watcher'
+                    ? 'border-blue-600 text-blue-600'
+                    : 'border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300'}">
+            CI Watcher
+          </button>
+        </div>
+      `;
+    }
+
+    // Switch active tab
+    function switchTab(tab) {
+      currentTab = tab;
+      localStorage.setItem('currentTab', tab);
+      renderTabBar();
       renderContent();
     }
 
@@ -237,6 +319,12 @@
     // Render main content
     function renderContent() {
       const content = document.getElementById('appContent');
+
+      if (currentTab === 'ci-watcher') {
+        renderCIWatcherView();
+        return;
+      }
+
       if (!currentUser) {
         content.innerHTML = renderLoginPage();
       } else {
@@ -1665,6 +1753,590 @@
       const modal = document.getElementById('screenshotsModal');
       modal.classList.add('hidden');
       document.body.style.overflow = '';
+    }
+
+    // ==========================================
+    // CI Watcher View
+    // ==========================================
+
+    const CATEGORY_STYLES = {
+      test_failure:    { bg: 'bg-amber-100',  text: 'text-amber-800',  bar: 'bg-amber-500',  label: 'Test Failure' },
+      build:           { bg: 'bg-orange-100', text: 'text-orange-800', bar: 'bg-orange-500', label: 'Build' },
+      cluster_install: { bg: 'bg-rose-100',   text: 'text-rose-800',   bar: 'bg-rose-500',   label: 'Cluster Install' },
+      image_pull:      { bg: 'bg-pink-100',   text: 'text-pink-800',   bar: 'bg-pink-500',   label: 'Image Pull' },
+      dependency:      { bg: 'bg-violet-100', text: 'text-violet-800', bar: 'bg-violet-500', label: 'Dependency' },
+      timeout:         { bg: 'bg-blue-100',   text: 'text-blue-800',   bar: 'bg-blue-500',   label: 'Timeout' },
+      infra:           { bg: 'bg-red-100',    text: 'text-red-800',    bar: 'bg-red-500',    label: 'Infra' },
+      unknown:         { bg: 'bg-gray-100',   text: 'text-gray-700',   bar: 'bg-gray-400',   label: 'Unknown' },
+    };
+
+    function getCategoryBadge(category) {
+      const s = CATEGORY_STYLES[category] || CATEGORY_STYLES.unknown;
+      return `<span class="px-2 py-0.5 ${s.bg} ${s.text} text-xs font-medium rounded-full">${s.label}</span>`;
+    }
+
+    // Helpers to compute aggregated analysis data from ciWatcherMeta + ciWatcherAnalysis
+    function getAnalyzedRuns() {
+      if (!ciWatcherMeta) return [];
+      return ciWatcherMeta.failedRuns.map(run => ({
+        ...run,
+        ...(ciWatcherAnalysis[run.buildId] || {}),
+        analyzed: !!ciWatcherAnalysis[run.buildId],
+      }));
+    }
+
+    function computeAggregates() {
+      const runs = getAnalyzedRuns().filter(r => r.analyzed);
+      const categorySummary = {};
+      const specData = {};  // { spec: { totalFailures, runCount, prs: Set, runs: [] } }
+      const prData = {};    // { prNumber: { count, title, author, categories: [] } }
+
+      for (const run of runs) {
+        const cat = run.category || 'unknown';
+        categorySummary[cat] = (categorySummary[cat] || 0) + 1;
+
+        const prKey = run.prNumber || 'unknown';
+        if (!prData[prKey]) prData[prKey] = { count: 0, title: run.prTitle, author: run.author, prLink: run.prLink, categories: {} };
+        prData[prKey].count++;
+        prData[prKey].categories[cat] = (prData[prKey].categories[cat] || 0) + 1;
+
+        for (const spec of (run.failingSpecs || [])) {
+          if (!specData[spec.spec]) specData[spec.spec] = { totalFailures: 0, runCount: 0, prs: new Set(), runs: [] };
+          specData[spec.spec].totalFailures += spec.count;
+          specData[spec.spec].runCount++;
+          if (run.prNumber) specData[spec.spec].prs.add(run.prNumber);
+          specData[spec.spec].runs.push({
+            buildId: run.buildId,
+            prNumber: run.prNumber,
+            prTitle: run.prTitle || '',
+            prLink: run.prLink || '',
+            author: run.author || '',
+            started: run.started,
+            duration: run.duration,
+            buildLogUrl: run.buildLogUrl,
+            prowUrl: run.prowUrl,
+            failCount: spec.count,
+          });
+        }
+      }
+
+      const topSpecs = Object.entries(specData)
+        .map(([spec, d]) => ({ spec, totalFailures: d.totalFailures, runCount: d.runCount, distinctPRs: d.prs.size, prList: [...d.prs], runs: d.runs }))
+        .sort((a, b) => b.distinctPRs - a.distinctPRs || b.runCount - a.runCount);
+
+      const prImpact = Object.entries(prData)
+        .map(([pr, d]) => ({ pr, ...d }))
+        .sort((a, b) => b.count - a.count);
+
+      return { categorySummary, topSpecs, prImpact };
+    }
+
+    // ---- Rendering ----
+
+    function renderCIWatcherView() {
+      const content = document.getElementById('appContent');
+      const busy = ciWatcherLoading || ciWatcherAnalyzing;
+
+      content.innerHTML = `
+        <div class="bg-white rounded-lg shadow p-4 mb-6">
+          <div class="flex flex-wrap items-center gap-4">
+            <div>
+              <label for="ciWatcherRepoSelect" class="block text-sm font-medium text-gray-700 mb-1">Repository</label>
+              <select id="ciWatcherRepoSelect" onchange="handleCIWatcherRepoChange(this.value)"
+                      class="block w-52 px-3 py-2 border border-gray-300 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                ${Object.entries(CI_WATCHER_REPOS).map(([key, r]) => `<option value="${key}" ${ciWatcherRepo === key ? 'selected' : ''}>${r.label}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label for="ciWatcherBranchSelect" class="block text-sm font-medium text-gray-700 mb-1">Branch</label>
+              <select id="ciWatcherBranchSelect" onchange="handleCIWatcherBranchChange(this.value)"
+                      class="block w-48 px-3 py-2 border border-gray-300 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                ${CI_WATCHER_BRANCHES.map(b => `<option value="${b}" ${ciWatcherBranch === b ? 'selected' : ''}>${b}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label for="ciWatcherJobSelect" class="block text-sm font-medium text-gray-700 mb-1">Job</label>
+              <select id="ciWatcherJobSelect" onchange="handleCIWatcherJobChange(this.value)"
+                      class="block w-52 px-3 py-2 border border-gray-300 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                ${getRepoJobs().map(j => `<option value="${j.suffix}" ${ciWatcherJob === j.suffix ? 'selected' : ''}>${j.label}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label for="ciWatcherLimitSelect" class="block text-sm font-medium text-gray-700 mb-1">Failed runs</label>
+              <select id="ciWatcherLimitSelect" onchange="handleCIWatcherLimitChange(this.value)"
+                      class="block w-24 px-3 py-2 border border-gray-300 rounded-lg bg-white text-sm focus:ring-2 focus:ring-blue-500 focus:border-blue-500">
+                ${[10, 25, 50, 100].map(n => `<option value="${n}" ${ciWatcherLimit === n ? 'selected' : ''}>${n}</option>`).join('')}
+              </select>
+            </div>
+            <div class="pt-5">
+              <button onclick="analyzeCIJobs()" ${busy ? 'disabled' : ''}
+                      class="flex items-center gap-2 px-5 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-colors text-sm">
+                ${busy ? `<div class="spinner" style="width:16px;height:16px;border-width:2px;border-top-color:white;"></div>` : `
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg>`}
+                ${ciWatcherLoading ? 'Fetching...' : ciWatcherAnalyzing ? `Analyzing ${ciWatcherAnalyzedCount}/${ciWatcherAnalyzeTotal}` : 'Analyze'}
+              </button>
+            </div>
+            ${ciWatcherMeta ? `<div class="pt-5 ml-auto text-sm text-gray-500">Job: <span class="font-mono text-gray-700">${ciWatcherMeta.jobName}</span></div>` : ''}
+          </div>
+        </div>
+        <div id="ciWatcherResults">
+          ${ciWatcherLoading ? renderCIWatcherFetchingState() : (ciWatcherMeta ? renderCIWatcherDashboard() : renderCIWatcherEmpty())}
+        </div>
+      `;
+    }
+
+    function handleCIWatcherRepoChange(repo) {
+      ciWatcherRepo = repo;
+      localStorage.setItem('ciWatcherRepo', repo);
+      const jobs = getRepoJobs();
+      ciWatcherJob = jobs[0]?.suffix || '';
+      localStorage.setItem('ciWatcherJob', ciWatcherJob);
+      ciWatcherMeta = null;
+      ciWatcherAnalysis = {};
+      renderCIWatcherView();
+    }
+
+    function handleCIWatcherBranchChange(branch) {
+      ciWatcherBranch = branch;
+      localStorage.setItem('ciWatcherBranch', branch);
+      ciWatcherMeta = null;
+      ciWatcherAnalysis = {};
+      renderCIWatcherView();
+    }
+
+    function handleCIWatcherJobChange(job) {
+      ciWatcherJob = job;
+      localStorage.setItem('ciWatcherJob', job);
+      ciWatcherMeta = null;
+      ciWatcherAnalysis = {};
+      renderCIWatcherView();
+    }
+
+    function handleCIWatcherLimitChange(value) {
+      ciWatcherLimit = parseInt(value) || 25;
+      localStorage.setItem('ciWatcherLimit', ciWatcherLimit);
+    }
+
+    function renderCIWatcherEmpty() {
+      return `
+        <div class="flex flex-col items-center justify-center py-16 text-center">
+          <svg class="w-16 h-16 text-gray-400 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+          </svg>
+          <h2 class="text-xl font-bold text-gray-900 mb-2">CI Watcher</h2>
+          <p class="text-gray-600 max-w-md">Select a branch and click <strong>Analyze</strong> to fetch the latest CI job runs, parse build logs, and identify failing test patterns.</p>
+        </div>`;
+    }
+
+    function renderCIWatcherFetchingState() {
+      return `
+        <div class="flex flex-col items-center justify-center py-16">
+          <div class="spinner mb-4" style="width:40px;height:40px;"></div>
+          <span class="text-gray-600">Fetching job history for <strong>${ciWatcherRepo}</strong> / <strong>${ciWatcherBranch}</strong> / <strong>${getRepoJobs().find(j => j.suffix === ciWatcherJob)?.label || ciWatcherJob}</strong>...</span>
+        </div>`;
+    }
+
+    // ---- Two-phase analysis ----
+
+    async function analyzeCIJobs() {
+      if (ciWatcherLoading || ciWatcherAnalyzing) return;
+
+      // Phase 1: fetch metadata
+      ciWatcherLoading = true;
+      ciWatcherMeta = null;
+      ciWatcherAnalysis = {};
+      ciWatcherExpandedRuns.clear();
+      ciWatcherExpandedSpecs.clear();
+      ciWatcherAnalyzedCount = 0;
+      renderCIWatcherView();
+
+      try {
+        const resp = await fetch(`/api/ci-watcher/${encodeURIComponent(ciWatcherBranch)}?limit=${ciWatcherLimit}&repo=${encodeURIComponent(ciWatcherRepo)}&job=${encodeURIComponent(ciWatcherJob)}`);
+        if (!resp.ok) { const e = await resp.json().catch(() => ({})); throw new Error(e.details || e.error || 'Failed'); }
+        ciWatcherMeta = await resp.json();
+      } catch (err) {
+        console.error('CI Watcher Phase 1 error:', err);
+        showAlert(`CI Watcher: ${err.message}`, 'error');
+        ciWatcherLoading = false;
+        renderCIWatcherView();
+        return;
+      }
+
+      ciWatcherLoading = false;
+      renderCIWatcherView(); // Show instant results
+
+      // Phase 2: analyze logs progressively
+      const failedRuns = ciWatcherMeta.failedRuns || [];
+      if (failedRuns.length === 0) return;
+
+      ciWatcherAnalyzing = true;
+      ciWatcherAnalyzeTotal = failedRuns.length;
+      updateCIWatcherProgress();
+
+      const BATCH_SIZE = 5;
+      for (let i = 0; i < failedRuns.length; i += BATCH_SIZE) {
+        const batch = failedRuns.slice(i, i + BATCH_SIZE).map(r => ({
+          buildId: r.buildId, buildLogUrl: r.buildLogUrl, durationSecs: r.durationSecs
+        }));
+
+        try {
+          const resp = await fetch('/api/ci-watcher/analyze-logs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ runs: batch, jobSuffix: ciWatcherJob, repo: ciWatcherRepo })
+          });
+          if (resp.ok) {
+            const data = await resp.json();
+            for (const result of data.results) {
+              ciWatcherAnalysis[result.buildId] = result;
+              ciWatcherAnalyzedCount++;
+            }
+          }
+        } catch (err) {
+          console.error('CI Watcher Phase 2 batch error:', err);
+        }
+
+        updateCIWatcherProgress();
+        refreshCIWatcherDashboard();
+      }
+
+      ciWatcherAnalyzing = false;
+      refreshCIWatcherDashboard();
+      updateCIWatcherProgress();
+    }
+
+    function updateCIWatcherProgress() {
+      const btn = document.querySelector('#appContent button[onclick="analyzeCIJobs()"]');
+      if (!btn) return;
+      if (ciWatcherAnalyzing) {
+        btn.disabled = true;
+        btn.innerHTML = `<div class="spinner" style="width:16px;height:16px;border-width:2px;border-top-color:white;"></div> Analyzing ${ciWatcherAnalyzedCount}/${ciWatcherAnalyzeTotal}`;
+      } else if (!ciWatcherLoading) {
+        btn.disabled = false;
+        btn.innerHTML = `<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/></svg> Analyze`;
+      }
+    }
+
+    function refreshCIWatcherDashboard() {
+      const el = document.getElementById('ciWatcherResults');
+      if (el && ciWatcherMeta) el.innerHTML = renderCIWatcherDashboard();
+    }
+
+    // ---- Dashboard rendering ----
+
+    function renderCIWatcherDashboard() {
+      if (!ciWatcherMeta) return '';
+      const meta = ciWatcherMeta;
+      const rs = meta.resultSummary;
+
+      if (meta.totalRuns === 0) {
+        return `<div class="bg-yellow-50 border border-yellow-200 rounded-lg p-6 text-center"><p class="text-yellow-800">No job history data found for <strong>${meta.branch}</strong>.</p></div>`;
+      }
+
+      if (rs.failure === 0) {
+        return `<div class="bg-green-50 border border-green-200 rounded-lg p-6 text-center">
+          <svg class="w-12 h-12 mx-auto mb-3 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+          <p class="text-green-800 font-medium">All ${meta.totalRuns} recent runs passed!</p></div>`;
+      }
+
+      const agg = computeAggregates();
+      const analyzedRuns = getAnalyzedRuns();
+
+      return `
+        ${renderSummaryCards(meta)}
+        ${ciWatcherAnalyzing ? renderProgressBar() : ''}
+        ${ciWatcherAnalyzedCount > 0 ? renderCategoryAndStageBreakdown(agg) : ''}
+        ${agg.topSpecs.length > 0 ? renderTopSpecsWithFlakeScore(agg) : ''}
+        ${agg.prImpact.length > 0 ? renderPRImpact(agg) : ''}
+        ${renderRunTimeline(analyzedRuns)}
+      `;
+    }
+
+    function renderProgressBar() {
+      const pct = ciWatcherAnalyzeTotal > 0 ? Math.round(ciWatcherAnalyzedCount / ciWatcherAnalyzeTotal * 100) : 0;
+      return `
+        <div class="bg-blue-50 border border-blue-200 rounded-lg p-3 mb-6 flex items-center gap-3">
+          <div class="spinner" style="border-top-color:#3b82f6;"></div>
+          <div class="flex-1">
+            <div class="flex justify-between text-sm text-blue-700 mb-1">
+              <span>Analyzing build logs...</span>
+              <span>${ciWatcherAnalyzedCount}/${ciWatcherAnalyzeTotal}</span>
+            </div>
+            <div class="h-2 bg-blue-200 rounded-full overflow-hidden">
+              <div class="h-full bg-blue-500 rounded-full transition-all" style="width:${pct}%"></div>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    function renderSummaryCards(meta) {
+      const rs = meta.resultSummary;
+      const passRateNum = parseInt(meta.passRate);
+      const prColor = passRateNum >= 70 ? 'text-green-600' : passRateNum >= 40 ? 'text-yellow-600' : 'text-red-600';
+      const prBorder = passRateNum >= 70 ? 'border-l-green-500' : passRateNum >= 40 ? 'border-l-yellow-500' : 'border-l-red-500';
+
+      return `
+        <div class="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+          <div class="bg-white rounded-lg shadow p-4 border-l-4 border-l-blue-500">
+            <div class="text-sm text-gray-500">Total Runs</div>
+            <div class="text-2xl font-bold text-gray-900">${meta.totalRuns}</div>
+          </div>
+          <div class="bg-white rounded-lg shadow p-4 border-l-4 border-l-red-500">
+            <div class="text-sm text-gray-500">Failed</div>
+            <div class="text-2xl font-bold text-red-600">${rs.failure}</div>
+          </div>
+          <div class="bg-white rounded-lg shadow p-4 border-l-4 ${prBorder}">
+            <div class="text-sm text-gray-500">Pass Rate</div>
+            <div class="text-2xl font-bold ${prColor}">${meta.passRate}</div>
+          </div>
+          <div class="bg-white rounded-lg shadow p-4 border-l-4 border-l-gray-400">
+            <div class="text-sm text-gray-500">Aborted</div>
+            <div class="text-2xl font-bold text-gray-600">${rs.aborted}</div>
+          </div>
+          <div class="bg-white rounded-lg shadow p-4 border-l-4 border-l-purple-500">
+            <div class="text-sm text-gray-500">Analyzed</div>
+            <div class="text-2xl font-bold text-gray-900">${ciWatcherAnalyzedCount}<span class="text-sm font-normal text-gray-500">/${ciWatcherAnalyzeTotal}</span></div>
+          </div>
+        </div>`;
+    }
+
+    function renderCategoryAndStageBreakdown(agg) {
+      const allCatKeys = Object.keys(CATEGORY_STYLES);
+      const catEntries = allCatKeys.filter(k => agg.categorySummary[k] > 0).map(k => ({
+        ...CATEGORY_STYLES[k], key: k, count: agg.categorySummary[k]
+      }));
+      const catTotal = catEntries.reduce((s, c) => s + c.count, 0);
+
+      return `
+        <div class="mb-6">
+          <div class="bg-white rounded-lg shadow p-4">
+            <h3 class="text-sm font-semibold text-gray-700 mb-3">Failure Categories</h3>
+            <div class="flex flex-wrap gap-3 mb-3">
+              ${catEntries.map(c => `<div class="flex items-center gap-1.5"><span class="w-3 h-3 rounded-full ${c.bar}"></span><span class="text-xs text-gray-700">${c.label}</span><span class="px-1.5 py-0.5 ${c.bg} ${c.text} text-xs font-medium rounded-full">${c.count}</span></div>`).join('')}
+            </div>
+            <div class="flex h-3 rounded-full overflow-hidden bg-gray-200">
+              ${catEntries.map(c => `<div class="${c.bar}" style="width:${(c.count / catTotal * 100).toFixed(1)}%" title="${c.label}: ${c.count}"></div>`).join('')}
+            </div>
+          </div>
+        </div>`;
+    }
+
+    function renderTopSpecsWithFlakeScore(agg) {
+      const specs = agg.topSpecs;
+      return `
+        <div class="bg-white rounded-lg shadow mb-6 overflow-hidden">
+          <div class="p-4 border-b bg-gray-50">
+            <h3 class="text-sm font-semibold text-gray-700">Top Failing Specs</h3>
+            <p class="text-xs text-gray-500 mt-1">Specs failing across many different PRs are confirmed flakes. Click a row to see affected PRs and build logs.</p>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="min-w-full text-sm">
+              <thead><tr class="border-b bg-gray-50">
+                <th class="text-left px-4 py-2 text-gray-600 font-medium">#</th>
+                <th class="text-left px-4 py-2 text-gray-600 font-medium">Spec</th>
+                <th class="text-center px-4 py-2 text-gray-600 font-medium">Flake Score</th>
+                <th class="text-right px-4 py-2 text-gray-600 font-medium">Runs</th>
+                <th class="text-right px-4 py-2 text-gray-600 font-medium">Failures</th>
+              </tr></thead>
+              <tbody>
+                ${specs.map((spec, idx) => {
+                  const isFlake = spec.distinctPRs >= 3;
+                  const isMaybe = spec.distinctPRs === 2;
+                  const isExpanded = ciWatcherExpandedSpecs.has(spec.spec);
+                  const flakeBadge = isFlake
+                    ? '<span class="px-2 py-0.5 bg-red-100 text-red-700 text-xs font-bold rounded-full">Flake</span>'
+                    : isMaybe
+                    ? '<span class="px-2 py-0.5 bg-yellow-100 text-yellow-700 text-xs font-medium rounded-full">Likely</span>'
+                    : '<span class="px-2 py-0.5 bg-green-100 text-green-700 text-xs font-medium rounded-full">1 PR</span>';
+                  const chevron = `<svg class="w-4 h-4 text-gray-400 transition-transform ${isExpanded ? 'rotate-90' : ''}" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"/></svg>`;
+
+                  const prsByNumber = {};
+                  for (const run of (spec.runs || [])) {
+                    const key = run.prNumber || 'unknown';
+                    if (!prsByNumber[key]) prsByNumber[key] = { prNumber: run.prNumber, prTitle: run.prTitle, prLink: run.prLink, author: run.author, runs: [] };
+                    prsByNumber[key].runs.push(run);
+                  }
+                  const prGroups = Object.values(prsByNumber).sort((a, b) => b.runs.length - a.runs.length);
+
+                  const detailsRow = isExpanded ? `
+                  <tr data-spec-detail="${idx}">
+                    <td colspan="5" class="px-0 py-0">
+                      <div class="bg-gray-50 border-t border-gray-200 px-4 py-3">
+                        ${prGroups.map(prGroup => `
+                          <div class="mb-3 last:mb-0">
+                            <div class="flex items-center gap-2 mb-1.5">
+                              <a href="${prGroup.prLink}" target="_blank" class="text-blue-600 hover:underline text-sm font-medium">#${prGroup.prNumber}</a>
+                              <span class="text-gray-700 text-xs truncate max-w-md" title="${escapeHtml(prGroup.prTitle)}">${escapeHtml((prGroup.prTitle || '').substring(0, 80))}</span>
+                              <span class="text-gray-400 text-xs">by ${escapeHtml(prGroup.author)}</span>
+                              <span class="ml-auto px-1.5 py-0.5 bg-red-100 text-red-700 text-xs font-medium rounded-full">${prGroup.runs.length}x</span>
+                            </div>
+                            <div class="flex flex-wrap gap-1.5 ml-4">
+                              ${prGroup.runs.map(run => `
+                                <a href="${run.buildLogUrl}" target="_blank"
+                                   class="inline-flex items-center gap-1 px-2 py-1 bg-white border border-gray-200 rounded text-xs text-gray-600 hover:border-blue-300 hover:text-blue-600 transition-colors"
+                                   title="Build ${run.buildId} - ${run.started}">
+                                  <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+                                  ${run.duration}
+                                  <span class="text-gray-400">${run.failCount > 0 ? '(' + run.failCount + ' failed)' : ''}</span>
+                                </a>
+                              `).join('')}
+                            </div>
+                          </div>
+                        `).join('')}
+                      </div>
+                    </td>
+                  </tr>` : '';
+
+                  return `
+                  <tr class="border-b hover:bg-gray-50 cursor-pointer ${isFlake ? 'bg-red-50/30' : ''}" onclick="toggleSpecRow('${escapeHtml(spec.spec).replace(/'/g, "\\'")}')">
+                    <td class="px-4 py-2.5 text-gray-400">${chevron}</td>
+                    <td class="px-4 py-2.5 font-mono text-red-800 text-xs whitespace-nowrap" title="${escapeHtml(spec.spec)}">${escapeHtml(spec.spec)}</td>
+                    <td class="px-4 py-2.5 text-center">${flakeBadge}<span class="ml-1 text-xs text-gray-500">${spec.distinctPRs} PRs</span></td>
+                    <td class="px-4 py-2.5 text-right"><span class="px-2 py-0.5 bg-red-100 text-red-700 text-xs font-medium rounded-full">${spec.runCount}</span></td>
+                    <td class="px-4 py-2.5 text-right text-gray-700">${spec.totalFailures}</td>
+                  </tr>${detailsRow}`;
+                }).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>`;
+    }
+
+    function toggleSpecRow(specName) {
+      if (ciWatcherExpandedSpecs.has(specName)) {
+        ciWatcherExpandedSpecs.delete(specName);
+      } else {
+        ciWatcherExpandedSpecs.add(specName);
+      }
+      refreshCIWatcherDashboard();
+    }
+
+    function renderPRImpact(agg) {
+      const prs = agg.prImpact.slice(0, 15);
+      return `
+        <div class="bg-white rounded-lg shadow mb-6 overflow-hidden">
+          <div class="p-4 border-b bg-gray-50">
+            <h3 class="text-sm font-semibold text-gray-700">PR Impact</h3>
+            <p class="text-xs text-gray-500 mt-1">PRs with the most failed CI runs.</p>
+          </div>
+          <div class="overflow-x-auto">
+            <table class="w-full text-sm">
+              <thead><tr class="border-b bg-gray-50">
+                <th class="text-left px-4 py-2 text-gray-600 font-medium">PR</th>
+                <th class="text-left px-4 py-2 text-gray-600 font-medium">Title</th>
+                <th class="text-left px-4 py-2 text-gray-600 font-medium">Author</th>
+                <th class="text-right px-4 py-2 text-gray-600 font-medium">Failures</th>
+                <th class="text-left px-4 py-2 text-gray-600 font-medium">Categories</th>
+              </tr></thead>
+              <tbody>
+                ${prs.map(p => `
+                  <tr class="border-b last:border-b-0 hover:bg-gray-50">
+                    <td class="px-4 py-2.5"><a href="${p.prLink}" target="_blank" class="text-blue-600 hover:underline font-medium">#${p.pr}</a></td>
+                    <td class="px-4 py-2.5 text-gray-700 text-xs truncate max-w-xs" title="${escapeHtml(p.title)}">${escapeHtml((p.title || '').substring(0, 60))}</td>
+                    <td class="px-4 py-2.5 text-gray-500 text-xs">${escapeHtml(p.author)}</td>
+                    <td class="px-4 py-2.5 text-right"><span class="px-2 py-0.5 bg-red-100 text-red-700 text-xs font-bold rounded-full">${p.count}x</span></td>
+                    <td class="px-4 py-2.5">${Object.entries(p.categories).map(([c, n]) => getCategoryBadge(c)).join(' ')}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>`;
+    }
+
+    function renderRunTimeline(runs) {
+      if (runs.length === 0) return '';
+      return `
+        <div class="bg-white rounded-lg shadow overflow-hidden">
+          <div class="p-4 border-b bg-gray-50">
+            <h3 class="text-sm font-semibold text-gray-700">Failed Runs (${runs.length})</h3>
+          </div>
+          <div class="divide-y" id="ciWatcherRunList">
+            ${runs.map((run, idx) => renderRunCard(run, idx)).join('')}
+          </div>
+        </div>`;
+    }
+
+    function renderRunCard(run, idx) {
+      const isExpanded = ciWatcherExpandedRuns.has(run.buildId);
+      const timeAgo = getRelativeTime(new Date(run.started));
+      const analysis = ciWatcherAnalysis[run.buildId];
+
+      return `
+        <div class="p-4" data-ci-run="${run.buildId}">
+          <div class="flex flex-wrap items-center gap-3">
+            <div class="flex items-center gap-2 min-w-0 flex-1">
+              ${run.prNumber ? `<a href="${run.prLink}" target="_blank" class="text-blue-600 hover:underline font-medium text-sm whitespace-nowrap">PR #${run.prNumber}</a>` : '<span class="text-gray-400 text-sm">No PR</span>'}
+              <span class="text-gray-400 text-xs">|</span>
+              <span class="text-gray-500 text-xs truncate" title="${escapeHtml(run.prTitle)}">${escapeHtml(run.prTitle)}</span>
+            </div>
+            <div class="flex items-center gap-2 flex-shrink-0">
+              <span class="text-gray-400 text-xs" title="${new Date(run.started).toLocaleString()}">${timeAgo}</span>
+              <span class="text-gray-400 text-xs">${run.duration}</span>
+              ${analysis ? getCategoryBadge(analysis.category) : '<span class="px-2 py-0.5 bg-gray-50 text-gray-400 text-xs rounded-full">pending</span>'}
+              <a href="${run.prowUrl}" target="_blank" class="text-gray-400 hover:text-blue-600 transition-colors" title="View in Prow">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"/></svg>
+              </a>
+              <button onclick="toggleCIWatcherRun('${run.buildId}')" class="text-sm text-blue-600 hover:text-blue-800 hover:bg-blue-50 px-2 py-1 rounded transition-colors">
+                ${isExpanded ? 'Hide' : 'Details'}
+              </button>
+            </div>
+          </div>
+          ${isExpanded ? renderRunDetails(run, analysis) : ''}
+        </div>`;
+    }
+
+    function renderRunDetails(run, analysis) {
+      if (!analysis) {
+        return `<div class="mt-3 bg-gray-50 rounded-lg p-3"><p class="text-sm text-gray-500">Analysis pending...</p></div>`;
+      }
+      if (!analysis.failingSpecs || analysis.failingSpecs.length === 0) {
+        return `
+          <div class="mt-3 bg-gray-50 rounded-lg p-3">
+            <p class="text-sm text-gray-500">No Cypress spec failures parsed. Category: <strong>${analysis.category}</strong>, Stage: <strong>${analysis.stage}</strong></p>
+            <a href="${run.buildLogUrl}" target="_blank" class="text-xs text-blue-600 hover:underline mt-1 inline-block">View raw build log</a>
+          </div>`;
+      }
+      return `
+        <div class="mt-3 bg-red-50 border border-red-200 rounded-lg p-3">
+          <div class="flex items-center justify-between mb-2">
+            <h4 class="text-sm font-medium text-red-900">Failing Specs (${analysis.failingSpecs.length})</h4>
+            <a href="${run.buildLogUrl}" target="_blank" class="text-xs text-blue-600 hover:underline">Build log</a>
+          </div>
+          <ul class="space-y-1">
+            ${analysis.failingSpecs.map(spec => `
+              <li class="flex items-center justify-between bg-white rounded px-3 py-1.5 border border-red-100 text-sm">
+                <span class="font-mono text-red-800 text-xs break-all" title="${escapeHtml(spec.spec)}">${escapeHtml(spec.spec)}</span>
+                <span class="ml-2 bg-red-100 text-red-700 px-2 py-0.5 rounded text-xs font-medium flex-shrink-0">${spec.count > 0 ? spec.count + ' failed' : 'failed'}</span>
+              </li>`).join('')}
+          </ul>
+        </div>`;
+    }
+
+    function toggleCIWatcherRun(buildId) {
+      if (ciWatcherExpandedRuns.has(buildId)) {
+        ciWatcherExpandedRuns.delete(buildId);
+      } else {
+        ciWatcherExpandedRuns.add(buildId);
+      }
+      const card = document.querySelector(`[data-ci-run="${buildId}"]`);
+      if (card) {
+        const runs = getAnalyzedRuns();
+        const run = runs.find(r => r.buildId === buildId);
+        if (run) card.outerHTML = renderRunCard(run, runs.indexOf(run));
+      }
+    }
+
+    function getRelativeTime(date) {
+      const now = new Date();
+      const diffMs = now - date;
+      const diffMins = Math.floor(diffMs / 60000);
+      if (diffMins < 1) return 'just now';
+      if (diffMins < 60) return `${diffMins}m ago`;
+      const diffHours = Math.floor(diffMins / 60);
+      if (diffHours < 24) return `${diffHours}h ago`;
+      const diffDays = Math.floor(diffHours / 24);
+      return `${diffDays}d ago`;
     }
 
     // Initialize on page load

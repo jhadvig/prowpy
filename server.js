@@ -551,97 +551,94 @@ function parseJobHistory(html, prNumber, ciJobName, repoName = 'console') {
 function parseCypressFailures(logContent) {
   const failingSpecs = [];
   let totalFailingCount = 0;
-
-  // The Cypress output has boxes like:
-  // ┌────────────────────────────────────────────────────────────────────────────────────────────────┐
-  // │ Tests:        2                                                                                │
-  // │ Passing:      0                                                                                │
-  // │ Failing:      2                                                                                │
-  // │ Spec Ran:     app/admission-webhook-warning-notifications.cy.ts                                │
-  // └────────────────────────────────────────────────────────────────────────────────────────────────┘
-
-  // Method 1: Find all Spec Ran lines and look for nearby Failing counts
-  // The spec name can contain paths like "app/foo.cy.ts" - capture everything up to .cy.ts
-  const specPattern = /Spec Ran:\s+([^\s│][^\n│]*?\.cy\.ts)/g;
-  const failingPattern = /Failing:\s+(\d+)/g;
-
-  // First, find all spec entries with their positions
-  const specEntries = [];
   let match;
-  while ((match = specPattern.exec(logContent)) !== null) {
-    specEntries.push({
-      spec: match[1].trim(),
-      position: match.index
-    });
+
+  // Cypress output flow per spec:
+  //   Running:  app/auth-multiuser-login.cy.ts              (27 of 61)
+  //   ... test output ...
+  //   | Failing:      2                                                |
+  //   | Spec Ran:     app/auth-multiuser-login.cy.ts                   |
+  //
+  // "Running:" lines are the most reliable source for full spec names
+  // because they are plain text on a single line, never truncated by
+  // box-drawing width constraints.
+
+  // Method 1: Correlate "Running:" lines with per-spec "Failing:" counts
+  const runningPattern = /Running:\s+(\S+\.cy\.ts)\s/g;
+  const runningEntries = [];
+  while ((match = runningPattern.exec(logContent)) !== null) {
+    runningEntries.push({ spec: match[1].trim(), position: match.index });
   }
 
-  // For each spec, find the Failing count that appears before it (in the same box)
-  for (const entry of specEntries) {
-    // Look backwards from the spec position to find the Failing count
-    // Search in a window of ~500 chars before the spec
-    const windowStart = Math.max(0, entry.position - 500);
-    const window = logContent.substring(windowStart, entry.position);
-
-    // Find the last Failing: X in this window
-    const failMatches = [...window.matchAll(/Failing:\s+(\d+)/g)];
-    if (failMatches.length > 0) {
-      const lastMatch = failMatches[failMatches.length - 1];
-      const failCount = parseInt(lastMatch[1], 10);
-
-      if (failCount > 0) {
-        totalFailingCount += failCount;
-        failingSpecs.push({
-          spec: entry.spec,
-          count: failCount
-        });
+  if (runningEntries.length > 0) {
+    for (let i = 0; i < runningEntries.length; i++) {
+      const entry = runningEntries[i];
+      const nextPos = i + 1 < runningEntries.length
+        ? runningEntries[i + 1].position
+        : logContent.length;
+      const section = logContent.substring(entry.position, nextPos);
+      const failMatches = [...section.matchAll(/Failing:\s+(\d+)/g)];
+      if (failMatches.length > 0) {
+        const lastMatch = failMatches[failMatches.length - 1];
+        const failCount = parseInt(lastMatch[1], 10);
+        if (failCount > 0) {
+          totalFailingCount += failCount;
+          failingSpecs.push({ spec: entry.spec, count: failCount });
+        }
       }
     }
   }
 
-  // Method 2: Fallback - line by line parsing
+  // Method 2: Fallback - use "Spec Ran:" lines from result boxes
   if (failingSpecs.length === 0) {
-    console.log('Using fallback line-by-line parsing');
+    const specPattern = /Spec Ran:\s+([^\s][^\n]*?\.cy\.ts)/g;
+    const specEntries = [];
+    while ((match = specPattern.exec(logContent)) !== null) {
+      specEntries.push({ spec: match[1].trim(), position: match.index });
+    }
+    for (const entry of specEntries) {
+      const windowStart = Math.max(0, entry.position - 500);
+      const windowSlice = logContent.substring(windowStart, entry.position);
+      const failMatches = [...windowSlice.matchAll(/Failing:\s+(\d+)/g)];
+      if (failMatches.length > 0) {
+        const lastMatch = failMatches[failMatches.length - 1];
+        const failCount = parseInt(lastMatch[1], 10);
+        if (failCount > 0) {
+          totalFailingCount += failCount;
+          failingSpecs.push({ spec: entry.spec, count: failCount });
+        }
+      }
+    }
+  }
+
+  // Method 3: Fallback - line by line parsing
+  if (failingSpecs.length === 0) {
     const lines = logContent.split('\n');
     let currentFailing = 0;
-
     for (const line of lines) {
-      // Match Failing count
       const failingMatch = line.match(/Failing:\s+(\d+)/);
       if (failingMatch) {
         currentFailing = parseInt(failingMatch[1], 10);
       }
-
-      // Match Spec Ran - capture path/filename.cy.ts
-      const specMatch = line.match(/Spec Ran:\s+(.+?\.cy\.ts)/);
+      const specMatch = line.match(/(?:Spec Ran:|Running:)\s+(.+?\.cy\.ts)/);
       if (specMatch && currentFailing > 0) {
         totalFailingCount += currentFailing;
-        failingSpecs.push({
-          spec: specMatch[1].trim(),
-          count: currentFailing
-        });
+        failingSpecs.push({ spec: specMatch[1].trim(), count: currentFailing });
         currentFailing = 0;
       }
     }
   }
 
-  // Method 3: Last resort - just find any .cy.ts files mentioned with failures
+  // Method 4: Last resort - find .cy.ts files near failure indicators
   if (failingSpecs.length === 0 && logContent.includes('Failing:')) {
-    console.log('Using last resort parsing - looking for any failing indicators');
-
-    // Check if there are any failures at all
     const totalFailMatch = logContent.match(/(\d+)\s+of\s+\d+\s+failed/);
     if (totalFailMatch) {
       totalFailingCount = parseInt(totalFailMatch[1], 10);
     }
-
-    // Find all .cy.ts files mentioned
-    const allSpecs = [...logContent.matchAll(/([a-zA-Z0-9\-_\/]+\.cy\.ts)/g)];
+    const allSpecs = [...logContent.matchAll(/([a-zA-Z0-9\-_./]+\.cy\.ts)/g)];
     const uniqueSpecNames = [...new Set(allSpecs.map(m => m[1]))];
-
-    // If we have failures but couldn't parse specs, just note that
     if (totalFailingCount > 0 && uniqueSpecNames.length > 0) {
-      // Add specs without individual counts
-      for (const spec of uniqueSpecNames.slice(0, 10)) { // Limit to 10
+      for (const spec of uniqueSpecNames.slice(0, 10)) {
         failingSpecs.push({ spec, count: 0 });
       }
     }
@@ -663,6 +660,116 @@ function parseCypressFailures(logContent) {
     specs: uniqueSpecs,
     count: totalFailingCount
   };
+}
+
+// Helper: Parse Go unit test failures from build log
+// Format: --- FAIL: TestName (0.00s)
+//         FAIL\tgithub.com/openshift/console/pkg/something\t0.123s
+function parseGoTestFailures(logContent) {
+  const failingTests = [];
+  let totalFailingCount = 0;
+
+  const lines = logContent.split('\n');
+  let currentPackage = '';
+
+  for (const line of lines) {
+    const packageFail = line.match(/^FAIL\t(\S+)\t/);
+    if (packageFail) {
+      currentPackage = packageFail[1];
+    }
+
+    const testFail = line.match(/^--- FAIL: (\S+)/);
+    if (testFail) {
+      totalFailingCount++;
+      failingTests.push({
+        spec: testFail[1],
+        count: 1,
+      });
+    }
+  }
+
+  // Also capture failing packages without individual test names
+  if (failingTests.length === 0) {
+    for (const line of lines) {
+      const packageFail = line.match(/^FAIL\t(\S+)\t/);
+      if (packageFail) {
+        totalFailingCount++;
+        failingTests.push({ spec: packageFail[1], count: 1 });
+      }
+    }
+  }
+
+  const uniqueTests = [];
+  const seen = new Set();
+  for (const item of failingTests) {
+    if (!seen.has(item.spec)) {
+      seen.add(item.spec);
+      uniqueTests.push(item);
+    }
+  }
+
+  return { specs: uniqueTests, count: totalFailingCount };
+}
+
+// Helper: Parse Jest/RTL test failures from build log
+// Format: FAIL packages/console-shared/src/utils/__tests__/something.spec.ts
+//         Test Suites: 2 failed, 98 passed, 100 total
+//         Tests:       5 failed, 300 passed, 305 total
+function parseJestFailures(logContent) {
+  const failingSpecs = [];
+  let totalFailingCount = 0;
+
+  const lines = logContent.split('\n');
+  for (const line of lines) {
+    // Jest prefixes failing suites with FAIL (with optional ANSI codes)
+    const stripped = line.replace(/\x1b\[[0-9;]*m/g, '').trim();
+
+    const failMatch = stripped.match(/^FAIL\s+(.+\.(spec|test)\.(ts|tsx|js|jsx))/);
+    if (failMatch) {
+      failingSpecs.push({ spec: failMatch[1].trim(), count: 1 });
+    }
+
+    const totalMatch = stripped.match(/Tests:\s+(\d+)\s+failed/);
+    if (totalMatch) {
+      totalFailingCount = parseInt(totalMatch[1], 10);
+    }
+  }
+
+  // If no individual FAIL lines found, check for i18n diff failures
+  if (failingSpecs.length === 0 && logContent.includes('i18n') &&
+      (logContent.includes('git diff') || logContent.includes('locales/'))) {
+    failingSpecs.push({ spec: 'i18n/locales check', count: 1 });
+    if (totalFailingCount === 0) totalFailingCount = 1;
+  }
+
+  const uniqueSpecs = [];
+  const seen = new Set();
+  for (const item of failingSpecs) {
+    if (!seen.has(item.spec)) {
+      seen.add(item.spec);
+      uniqueSpecs.push(item);
+    }
+  }
+
+  if (totalFailingCount === 0 && uniqueSpecs.length > 0) {
+    totalFailingCount = uniqueSpecs.length;
+  }
+
+  return { specs: uniqueSpecs, count: totalFailingCount };
+}
+
+// Dispatcher: pick the right test parser based on repo + job suffix
+function parseTestFailures(logContent, repo, jobSuffix) {
+  const repoConfig = CI_WATCHER_REPOS[repo];
+  const jobConfig = repoConfig && repoConfig.jobs.find(j => j.suffix === jobSuffix);
+  const parser = jobConfig ? jobConfig.parser : 'none';
+
+  switch (parser) {
+    case 'cypress': return parseCypressFailures(logContent);
+    case 'go':      return parseGoTestFailures(logContent);
+    case 'jest':    return parseJestFailures(logContent);
+    default:        return { specs: [], count: 0 };
+  }
 }
 
 // API: Get screenshots for a spec
@@ -742,6 +849,319 @@ app.get('/api/screenshots/:prNumber/:runId', async (req, res) => {
 
     res.status(500).json({ error: 'Failed to fetch screenshots', details: error.message });
   }
+});
+
+// CI Watcher: Extract the "Older Runs" pagination buildId from job-history HTML
+function parseOlderRunsBuildId(html) {
+  const match = html.match(/href="[^"]*\?buildId=(\d+)"[^>]*>[^<]*Older\s+Runs/i);
+  return match ? match[1] : null;
+}
+
+// CI Watcher: Parse Prow job-history page HTML
+// The page embeds build data as JSON: var allBuilds = [{...}, ...];
+function parseJobHistoryPage(html) {
+  const match = html.match(/var\s+allBuilds\s*=\s*(\[[\s\S]*?\]);\s*\n/);
+  if (!match) {
+    console.error('Could not find allBuilds data in job-history page');
+    return [];
+  }
+
+  try {
+    const builds = JSON.parse(match[1]);
+    return builds.map(build => {
+      const pull = build.Refs?.pulls?.[0];
+      const durationSecs = Math.floor((build.Duration || 0) / 1e9);
+      const hours = Math.floor(durationSecs / 3600);
+      const minutes = Math.floor((durationSecs % 3600) / 60);
+      const seconds = durationSecs % 60;
+      let duration = '';
+      if (hours > 0) duration += `${hours}h `;
+      if (minutes > 0 || hours > 0) duration += `${minutes}m `;
+      duration += `${seconds}s`;
+
+      return {
+        buildId: build.ID,
+        prNumber: pull?.number || null,
+        author: pull?.author || '',
+        prTitle: pull?.title || '',
+        prLink: pull?.link || '',
+        started: build.Started,
+        duration: duration.trim(),
+        durationSecs,
+        result: build.Result,
+        prowUrl: `https://prow.ci.openshift.org${build.SpyglassLink}`,
+        buildLogUrl: `${GCS_BASE_URL}${build.SpyglassLink.replace('/view/gs/test-platform-results', '')}/build-log.txt`
+      };
+    });
+  } catch (error) {
+    console.error('Error parsing allBuilds JSON:', error.message);
+    return [];
+  }
+}
+
+// CI Watcher: Categorize a build failure based on log content and duration
+function categorizeFailure(logContent, testResult, durationSecs) {
+  if (testResult && testResult.specs && testResult.specs.length > 0) {
+    return 'test_failure';
+  }
+  if (!logContent) return 'unknown';
+
+  const logLower = logContent.toLowerCase();
+
+  // Build/compile errors (webpack, TypeScript, yarn build)
+  if (/error in \.\//.test(logLower) ||
+      logLower.includes('module not found') ||
+      logLower.includes('compiled with') && logLower.includes('error') ||
+      logLower.includes('build-frontend.sh') && logLower.includes('exit status')) {
+    return 'build';
+  }
+
+  // Dependency fetch failures (yarn/npm registry)
+  if ((logLower.includes('connecttimeouterror') || logLower.includes('fetch failed')) &&
+      (logLower.includes('yarnpkg') || logLower.includes('npmjs') || logLower.includes('registry'))) {
+    return 'dependency';
+  }
+
+  // Image pull failures
+  if (logLower.includes('unable to read image') ||
+      logLower.includes('image pull back-off') ||
+      logLower.includes('errimagepull')) {
+    return 'image_pull';
+  }
+
+  // Cluster install failures
+  if (logLower.includes('failed to create install config') ||
+      logLower.includes('failed to fetch master machines') ||
+      (logLower.includes('ipi-install') && logLower.includes('pod') && logLower.includes('failed'))) {
+    return 'cluster_install';
+  }
+
+  // Timeouts
+  if (['deadlineexceeded', 'context deadline exceeded', 'timed out waiting',
+       'exceeded the timeout', 'step exceeded its timeout', 'pod deadline exceeded']
+      .some(p => logLower.includes(p))) {
+    return 'timeout';
+  }
+
+  // Infrastructure failures
+  if (['could not start pod', 'cluster failed to provision', 'error creating cluster',
+       'failed to create cluster', 'infrastructure error', 'unable to provision',
+       'failed to setup cluster', 'no available capacity', 'quota exceeded', 'insufficient quota']
+      .some(p => logLower.includes(p))) {
+    return 'infra';
+  }
+
+  // Duration heuristic: very short failures (<5 min) with no other match are likely build/infra
+  if (durationSecs > 0 && durationSecs < 300 && logLower.includes('failed')) {
+    return 'infra';
+  }
+
+  return 'unknown';
+}
+
+// CI Watcher: Detect at which pipeline stage the failure occurred
+function detectFailureStage(logContent, durationSecs, testResult) {
+  if (!logContent) return 'unknown';
+  const log = logContent.toLowerCase();
+
+  // If test failures were actually parsed, the job reached the test phase
+  // regardless of what other keywords appear in the log.
+  if (testResult && testResult.specs && testResult.specs.length > 0) {
+    return 'e2e-test';
+  }
+
+  if ((log.includes('error in ./') || log.includes('module not found') || log.includes('compiled with')) &&
+      (log.includes('webpack') || log.includes('build-frontend'))) {
+    return 'build';
+  }
+  if (log.includes('dockerbuildfailed') || (log.includes('build') && log.includes('failed') && durationSecs < 600)) {
+    return 'build';
+  }
+  if ((log.includes('ipi-install') && log.includes('failed')) ||
+      (log.includes('failed to create install config')) ||
+      (log.includes('failed to fetch master machines'))) {
+    return 'cluster-setup';
+  }
+  if ((log.includes('could not run steps') && log.includes('pre steps failed')) ||
+      (log.includes('unable to read image') && durationSecs < 1800)) {
+    return 'cluster-setup';
+  }
+  if (log.includes('failed to get pod') && log.includes('lifecycle metrics') && durationSecs < 600) {
+    return 'cluster-setup';
+  }
+  if (log.includes('spec ran:') || log.includes('cypress')) {
+    return 'e2e-test';
+  }
+  if (durationSecs > 3600) return 'e2e-test';
+  if (durationSecs < 60) return 'setup';
+  return 'unknown';
+}
+
+// CI Watcher: Supported branches
+const CI_WATCHER_BRANCHES = [
+  'main', 'release-4.21', 'release-4.20', 'release-4.19',
+  'release-4.18', 'release-4.17', 'release-4.16', 'release-4.15'
+];
+
+// CI Watcher: Per-repo job configuration
+const CI_WATCHER_REPOS = {
+  'console': {
+    prefix: 'pull-ci-openshift-console',
+    jobs: [
+      { suffix: 'e2e-gcp-console', label: 'E2E GCP Console',  parser: 'cypress' },
+      { suffix: 'analyze',         label: 'Analyze',           parser: 'none' },
+      { suffix: 'backend',         label: 'Backend',           parser: 'go' },
+      { suffix: 'frontend',        label: 'Frontend',          parser: 'jest' },
+      { suffix: 'images',          label: 'Images',            parser: 'none' },
+      { suffix: 'okd-scos-images', label: 'OKD SCOS Images',   parser: 'none' },
+    ],
+  },
+  'console-operator': {
+    prefix: 'pull-ci-openshift-console-operator',
+    jobs: [
+      { suffix: 'e2e-aws-console',      label: 'E2E AWS Console',      parser: 'cypress' },
+      { suffix: 'e2e-aws-operator',      label: 'E2E AWS Operator',     parser: 'go' },
+      { suffix: 'e2e-azure-ovn-upgrade', label: 'E2E Azure Upgrade',    parser: 'none' },
+      { suffix: 'e2e-gcp-ovn',          label: 'E2E GCP OVN',          parser: 'none' },
+      { suffix: 'images',               label: 'Images',               parser: 'none' },
+      { suffix: 'okd-scos-images',      label: 'OKD SCOS Images',      parser: 'none' },
+      { suffix: 'unit',                 label: 'Unit',                 parser: 'go' },
+      { suffix: 'verify',               label: 'Verify',              parser: 'none' },
+      { suffix: 'verify-deps',          label: 'Verify Deps',         parser: 'none' },
+    ],
+  },
+};
+
+// Phase 1 API: CI Watcher - Get job history metadata (fast, no log downloads)
+app.get('/api/ci-watcher/:branch', async (req, res) => {
+  const { branch } = req.params;
+  const limit = Math.min(parseInt(req.query.limit) || 25, 100);
+  const repo = req.query.repo || 'console';
+  const jobSuffix = req.query.job || (repo === 'console' ? 'e2e-gcp-console' : 'e2e-aws-console');
+
+  if (!CI_WATCHER_BRANCHES.includes(branch)) {
+    return res.status(400).json({ error: `Invalid branch. Supported: ${CI_WATCHER_BRANCHES.join(', ')}` });
+  }
+
+  const repoConfig = CI_WATCHER_REPOS[repo];
+  if (!repoConfig) {
+    return res.status(400).json({ error: `Invalid repo. Supported: ${Object.keys(CI_WATCHER_REPOS).join(', ')}` });
+  }
+
+  if (!repoConfig.jobs.some(j => j.suffix === jobSuffix)) {
+    return res.status(400).json({ error: `Invalid job for ${repo}. Supported: ${repoConfig.jobs.map(j => j.suffix).join(', ')}` });
+  }
+
+  const branchSlug = branch === 'master' ? 'main' : branch;
+  const ciJobName = `${repoConfig.prefix}-${branchSlug}-${jobSuffix}`;
+  const jobHistoryBaseUrl = `https://prow.ci.openshift.org/job-history/gs/test-platform-results/pr-logs/directory/${ciJobName}`;
+
+  console.log(`CI Watcher: Fetching job history for ${repo}/${branch}, job=${jobSuffix}, limit=${limit}`);
+
+  try {
+    const MAX_PAGES = Math.ceil(limit / 4) + 1;
+    const allRuns = [];
+    const failedRuns = [];
+    let nextBuildId = null;
+
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const pageUrl = nextBuildId
+        ? `${jobHistoryBaseUrl}?buildId=${nextBuildId}`
+        : jobHistoryBaseUrl;
+
+      console.log(`CI Watcher: Fetching page ${page + 1}`);
+
+      const historyResponse = await axios.get(pageUrl, {
+        timeout: 30000,
+        headers: { 'User-Agent': 'Prowpy/1.0', 'Accept': 'text/html,application/xhtml+xml' }
+      });
+
+      const pageRuns = parseJobHistoryPage(historyResponse.data);
+      if (pageRuns.length === 0) break;
+
+      allRuns.push(...pageRuns);
+      failedRuns.push(...pageRuns.filter(r => r.result === 'FAILURE'));
+
+      if (failedRuns.length >= limit) break;
+
+      nextBuildId = parseOlderRunsBuildId(historyResponse.data);
+      if (!nextBuildId) break;
+    }
+
+    const totalRuns = allRuns.length;
+    const successCount = allRuns.filter(r => r.result === 'SUCCESS').length;
+    const abortedCount = allRuns.filter(r => r.result === 'ABORTED').length;
+    const pendingCount = allRuns.filter(r => r.result === 'PENDING').length;
+
+    res.json({
+      branch,
+      jobName: ciJobName,
+      totalRuns,
+      resultSummary: {
+        success: successCount,
+        failure: failedRuns.length,
+        aborted: abortedCount,
+        pending: pendingCount,
+      },
+      passRate: totalRuns > 0 ? Math.round((successCount / totalRuns) * 100) + '%' : '0%',
+      failedRuns: failedRuns.slice(0, limit),
+      allRuns,
+    });
+  } catch (error) {
+    console.error('CI Watcher error:', error.message);
+    res.status(500).json({ error: 'Failed to fetch CI job history', details: error.message });
+  }
+});
+
+// Phase 2 API: CI Watcher - Analyze a batch of build logs (progressive)
+app.post('/api/ci-watcher/analyze-logs', async (req, res) => {
+  const { runs, jobSuffix, repo } = req.body;
+  const repoKey = repo || 'console';
+  if (!runs || !Array.isArray(runs) || runs.length === 0) {
+    return res.status(400).json({ error: 'Missing runs array' });
+  }
+
+  const CONCURRENCY = 5;
+  const results = [];
+
+  for (let i = 0; i < runs.length; i += CONCURRENCY) {
+    const batch = runs.slice(i, i + CONCURRENCY);
+    const batchResults = await Promise.all(batch.map(async (run) => {
+      try {
+        const logResponse = await axios.get(run.buildLogUrl, {
+          timeout: 60000,
+          headers: { 'User-Agent': 'Prowpy/1.0' },
+          maxContentLength: 50 * 1024 * 1024
+        });
+
+        const logContent = logResponse.data;
+        const testResult = parseTestFailures(logContent, repoKey, jobSuffix || 'e2e-gcp-console');
+        const category = categorizeFailure(logContent, testResult, run.durationSecs || 0);
+        const stage = detectFailureStage(logContent, run.durationSecs || 0, testResult);
+
+        return {
+          buildId: run.buildId,
+          category,
+          stage,
+          failingSpecs: testResult.specs || [],
+          failingSpecCount: testResult.count || 0,
+        };
+      } catch (logError) {
+        console.error(`CI Watcher: Error fetching log for build ${run.buildId}:`, logError.message);
+        return {
+          buildId: run.buildId,
+          category: 'unknown',
+          stage: 'unknown',
+          failingSpecs: [],
+          failingSpecCount: 0,
+          fetchError: logError.message,
+        };
+      }
+    }));
+    results.push(...batchResults);
+  }
+
+  res.json({ results });
 });
 
 // Serve frontend
